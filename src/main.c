@@ -259,7 +259,7 @@ static int mcu_cmd_send(struct mcu *mcu, struct cmd *cmd)
 	if (mcu->error_timeout.pending)
 		return -EBUSY;
 
-	log_packet(LOG_DEBUG, "TX ->", cmd->cmd);
+	log_packet(LOG_NOTICE, "TX ->", cmd->cmd);
 	mcu->response_timeout.cb = mcu_no_response;
 	uloop_timeout_set(&mcu->response_timeout, 2000);
 	return ustream_write(&mcu->stream.stream, (void *)cmd->cmd, 12, false);
@@ -803,7 +803,7 @@ static int mcu_handle_reply(struct mcu *mcu, uint8_t *reply)
 	enum poe_cmd command;
 
 	uloop_timeout_cancel(&mcu->response_timeout);
-	log_packet(LOG_DEBUG, "RX <-", reply);
+	log_packet(LOG_NOTICE, "RX <-", reply);
 
 	if (list_empty(&mcu->pending_cmds)) {
 		ULOG_ERR("received unsolicited reply\n");
