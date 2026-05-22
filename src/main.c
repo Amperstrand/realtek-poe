@@ -52,6 +52,7 @@ struct poe_ctx {
 	struct blob_buf blob_buf;
 	struct uloop_timeout state_timeout;
 	unsigned int hardcore_hacking_mode_en : 1;
+	unsigned int threshold_over_active : 1;
 };
 
 static struct poe_ctx *ubus_to_poe_ctx(struct ubus_context *u)
@@ -135,16 +136,24 @@ static void load_global_config(struct config *cfg, struct uci_context *uci,
 
 {
 	const char *budget, *guardband, *baudrate_hack, *dialect_hack;
+	const char *threshold_high, *threshold_low;
 
 	budget = uci_lookup_option_string(uci, s, "budget");
 	guardband = uci_lookup_option_string(uci, s, "guard");
 	baudrate_hack = uci_lookup_option_string(uci, s, "force_baudrate");
 	dialect_hack = uci_lookup_option_string(uci, s, "force_dialect");
+	threshold_high = uci_lookup_option_string(uci, s, "power_threshold_high");
+	threshold_low = uci_lookup_option_string(uci, s, "power_threshold_low");
 
 	cfg->budget = budget ? strtof(budget, NULL) : 31.0;
 	cfg->budget_guard = cfg->budget / 10;
 	if (guardband)
 		cfg->budget_guard = strtof(guardband, NULL);
+
+	cfg->threshold_high = threshold_high ? strtof(threshold_high, NULL) : 0.0;
+	cfg->threshold_low = threshold_low ? strtof(threshold_low, NULL) : 0.0;
+	if (cfg->threshold_high > 0.0 && cfg->threshold_low <= 0.0)
+		cfg->threshold_low = cfg->threshold_high - 10.0;
 
 	if (baudrate_hack) {
 		warn_unsupported_config("force_baudrate");
@@ -1123,6 +1132,42 @@ static int poe_initial_setup(struct mcu* mcu, const struct config *cfg)
 	return 0;
 }
 
+static void poe_check_power_threshold(struct poe_ctx *poe)
+{
+	const struct config *cfg = &poe->config;
+	const struct mcu_state *state = &poe->mcu.state;
+	struct blob_buf *b = &poe->blob_buf;
+	float pct;
+	const char *event;
+
+	if (cfg->threshold_high <= 0.0 || cfg->budget <= 0.0)
+		return;
+
+	pct = state->power_consumption / cfg->budget * 100.0;
+
+	if (!poe->threshold_over_active && pct >= cfg->threshold_high) {
+		poe->threshold_over_active = 1;
+		event = "over";
+	} else if (poe->threshold_over_active && pct <= cfg->threshold_low) {
+		poe->threshold_over_active = 0;
+		event = "below";
+	} else {
+		return;
+	}
+
+	ULOG_INFO("Power usage goes %s Threshold: %d%% (consumption=%.1fW budget=%.1fW)\n",
+		    event, (int)pct, state->power_consumption, cfg->budget);
+
+	blob_buf_init(b, 0);
+	blobmsg_add_string(b, "event", event);
+	blobmsg_add_double(b, "consumption", state->power_consumption);
+	blobmsg_add_double(b, "budget", cfg->budget);
+	blobmsg_add_double(b, "percentage", pct);
+	blobmsg_add_double(b, "threshold_high", cfg->threshold_high);
+	blobmsg_add_double(b, "threshold_low", cfg->threshold_low);
+	ubus_send_event(&poe->conn.ctx, "poe.power_threshold", b->head);
+}
+
 static void state_timeout_cb(struct uloop_timeout *t)
 {
 	struct poe_ctx *poe = container_of(t, struct poe_ctx, state_timeout);
@@ -1135,6 +1180,8 @@ static void state_timeout_cb(struct uloop_timeout *t)
 		uloop_timeout_set(t, 1 * 1000);
 		return;
 	}
+
+	poe_check_power_threshold(poe);
 
 	poe_cmd_power_stats(mcu);
 	mcu->state.allocated_power = 0;

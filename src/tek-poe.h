@@ -150,6 +150,12 @@ struct config {
 	float budget;
 	float budget_guard;
 
+	/* Power threshold monitoring. Emits ubus "power_threshold" events
+	 * when consumption crosses high/low (% of budget). 0.0 disables.
+	 */
+	float threshold_high;
+	float threshold_low;
+
 	unsigned int forced_baudrate;
 	unsigned int port_count;
 	uint8_t pse_id_set_budget_mask;
