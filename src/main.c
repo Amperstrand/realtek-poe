@@ -57,6 +57,11 @@ struct poe_ctx {
 	/* Snapshot of last reported per-port status for edge-triggered events. */
 	const char *last_port_status[MAX_PORT];
 	uint8_t last_port_class[MAX_PORT];
+	uint16_t last_cnt_overload[MAX_PORT];
+	uint16_t last_cnt_short[MAX_PORT];
+	uint16_t last_cnt_denied[MAX_PORT];
+	uint16_t last_cnt_mps_absent[MAX_PORT];
+	uint16_t last_cnt_invalid_signature[MAX_PORT];
 	unsigned int port_status_initialized : 1;
 };
 
@@ -1173,6 +1178,13 @@ static void poe_check_power_threshold(struct poe_ctx *poe)
 	ubus_send_event(&poe->conn.ctx, "poe.power_threshold", b->head);
 }
 
+static int port_status_is_fault(const char *status)
+{
+	if (!status)
+		return 0;
+	return !strcmp(status, "Fault") || !strcmp(status, "Other fault");
+}
+
 static void poe_check_port_status_changes(struct poe_ctx *poe)
 {
 	const struct mcu_state *state = &poe->mcu.state;
@@ -1184,39 +1196,75 @@ static void poe_check_port_status_changes(struct poe_ctx *poe)
 		for (i = 0; i < cfg->port_count && i < MAX_PORT; i++) {
 			poe->last_port_status[i] = state->ports[i].status;
 			poe->last_port_class[i] = state->ports[i].class_info;
+			poe->last_cnt_overload[i] = state->ports[i].cnt_overload;
+			poe->last_cnt_short[i] = state->ports[i].cnt_short;
+			poe->last_cnt_denied[i] = state->ports[i].cnt_denied;
+			poe->last_cnt_mps_absent[i] = state->ports[i].cnt_mps_absent;
+			poe->last_cnt_invalid_signature[i] = state->ports[i].cnt_invalid_signature;
 		}
 		poe->port_status_initialized = 1;
 		return;
 	}
 
 	for (i = 0; i < cfg->port_count && i < MAX_PORT; i++) {
-		const char *cur = state->ports[i].status;
+		const struct port_state *p = &state->ports[i];
+		const char *cur = p->status;
 		const char *prev = poe->last_port_status[i];
-		uint8_t cur_cls = state->ports[i].class_info;
+		uint8_t cur_cls = p->class_info;
 		uint8_t prev_cls = poe->last_port_class[i];
 		int status_changed = (cur != prev) && (!cur || !prev || strcmp(cur, prev));
 		int class_changed = cur_cls != prev_cls;
+		int is_fault = port_status_is_fault(cur);
+		char fault_reason[128];
+		size_t fr = 0;
 
-		if (!status_changed && !class_changed)
-			continue;
+		fault_reason[0] = '\0';
+		if (is_fault) {
+			/* Compose fault_reason from counters that ticked this cycle. */
+			#define APPEND_REASON(field, label) do { \
+				if (p->field != poe->last_##field[i]) \
+					fr += snprintf(fault_reason + fr, \
+						sizeof(fault_reason) - fr, \
+						"%s%s", fr ? "," : "", label); \
+			} while (0)
+			APPEND_REASON(cnt_overload, "overload");
+			APPEND_REASON(cnt_short, "short");
+			APPEND_REASON(cnt_denied, "denied");
+			APPEND_REASON(cnt_mps_absent, "mps_absent");
+			APPEND_REASON(cnt_invalid_signature, "invalid_signature");
+			#undef APPEND_REASON
+		}
 
-		ULOG_INFO("Port %s status: %s -> %s (class %d -> %d)\n",
-			  cfg->ports[i].name,
-			  prev ? prev : "(none)", cur ? cur : "(none)",
-			  prev_cls, cur_cls);
+		if (status_changed || class_changed) {
+			ULOG_INFO("Port %s status: %s -> %s (class %d -> %d)%s%s\n",
+				  cfg->ports[i].name,
+				  prev ? prev : "(none)", cur ? cur : "(none)",
+				  prev_cls, cur_cls,
+				  is_fault ? " fault=" : "",
+				  is_fault ? (fault_reason[0] ? fault_reason : "unknown") : "");
 
-		blob_buf_init(b, 0);
-		blobmsg_add_string(b, "port", cfg->ports[i].name);
-		blobmsg_add_u32(b, "index", i + 1);
-		blobmsg_add_string(b, "status", cur ? cur : "");
-		blobmsg_add_string(b, "prev_status", prev ? prev : "");
-		blobmsg_add_u32(b, "class", cur_cls);
-		blobmsg_add_u32(b, "prev_class", prev_cls);
-		blobmsg_add_double(b, "watt", state->ports[i].watt);
-		ubus_send_event(&poe->conn.ctx, "poe.port_status", b->head);
+			blob_buf_init(b, 0);
+			blobmsg_add_string(b, "port", cfg->ports[i].name);
+			blobmsg_add_u32(b, "index", i + 1);
+			blobmsg_add_string(b, "status", cur ? cur : "");
+			blobmsg_add_string(b, "prev_status", prev ? prev : "");
+			blobmsg_add_u32(b, "class", cur_cls);
+			blobmsg_add_u32(b, "prev_class", prev_cls);
+			blobmsg_add_double(b, "watt", p->watt);
+			blobmsg_add_u8(b, "fault", is_fault);
+			if (is_fault)
+				blobmsg_add_string(b, "fault_reason",
+					fault_reason[0] ? fault_reason : "unknown");
+			ubus_send_event(&poe->conn.ctx, "poe.port_status", b->head);
+		}
 
 		poe->last_port_status[i] = cur;
 		poe->last_port_class[i] = cur_cls;
+		poe->last_cnt_overload[i] = p->cnt_overload;
+		poe->last_cnt_short[i] = p->cnt_short;
+		poe->last_cnt_denied[i] = p->cnt_denied;
+		poe->last_cnt_mps_absent[i] = p->cnt_mps_absent;
+		poe->last_cnt_invalid_signature[i] = p->cnt_invalid_signature;
 	}
 }
 
