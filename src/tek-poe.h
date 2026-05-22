@@ -44,6 +44,8 @@ enum poe_cmd {
 	PORT_GET_STATUS,
 	PORT_GET_SHORT_STATUS,
 	PORT_GET_POWER_STATS,
+	MCU_GET_PSE_POWER,
+	PORT_GET_COUNTERS,
 	CMD_MAX
 };
 
@@ -60,6 +62,9 @@ struct port_state {
 	const char *poe_mode;
 	float power_budget;
 	float watt;
+	float voltage;		/* Measured voltage in mV (from 0x30 reply, units of 64.45mV) */
+	float current;		/* Measured current in mA (from 0x30 reply, units of 1mA) */
+	float temperature;	/* Measured temperature in °C (from 0x30 reply: (220 - raw) * 1.25) */
 
 	unsigned int has_config_info : 1;
 	unsigned int has_detailed_state : 1;
@@ -79,6 +84,12 @@ struct port_state {
 	uint8_t class_info;
 	uint8_t pd_type;
 	uint8_t mpss_mask;
+
+	uint16_t cnt_overload;
+	uint16_t cnt_short;
+	uint16_t cnt_denied;
+	uint16_t cnt_mps_absent;
+	uint16_t cnt_invalid_signature;
 };
 
 struct mcu_state {
@@ -87,6 +98,7 @@ struct mcu_state {
 	const char *sys_status;
 	float power_consumption;
 	float reported_power_budget;
+	float allocated_power;
 	float uvlo_threshold;
 	float ovlo_threshold;
 	unsigned int num_detected_ports;

@@ -259,7 +259,7 @@ static int mcu_cmd_send(struct mcu *mcu, struct cmd *cmd)
 	if (mcu->error_timeout.pending)
 		return -EBUSY;
 
-	log_packet(LOG_NOTICE, "TX ->", cmd->cmd);
+	log_packet(LOG_DEBUG, "TX ->", cmd->cmd);
 	mcu->response_timeout.cb = mcu_no_response;
 	uloop_timeout_set(&mcu->response_timeout, 2000);
 	return ustream_write(&mcu->stream.stream, (void *)cmd->cmd, 12, false);
@@ -560,6 +560,23 @@ static int poe_reply_power_stats(struct mcu_state *state, uint8_t *reply)
 	return 0;
 }
 
+/* 0x29 - Get all PSE output consumed power */
+static int poe_cmd_pse_power(struct mcu *mcu)
+{
+	uint8_t cmd[] = { MCU_GET_PSE_POWER };
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
+static int poe_reply_pse_power(struct mcu_state *state, uint8_t *reply)
+{
+	uint16_t raw = read16_be(reply + 2);
+	if (raw != 0xffff)
+		state->allocated_power = raw * 0.2;
+
+	return 0;
+}
+
 /* 0x25 - Get port config */
 static int poe_cmd_port_config(struct mcu *mcu, uint8_t port)
 {
@@ -712,7 +729,35 @@ static int poe_reply_port_power_stats(struct mcu_state *state, uint8_t *reply)
 		return -EPROTO;
 	}
 
+	state->ports[port_idx].voltage = read16_be(reply + 3) * 64.45;
+	state->ports[port_idx].current = read16_be(reply + 5);
+	state->ports[port_idx].temperature = (220 - read16_be(reply + 7)) * 1.25;
 	state->ports[port_idx].watt = read16_be(reply + 9) * 0.1;
+	return 0;
+}
+
+/* 0x22 - Get port counters */
+static int poe_cmd_port_counters(struct mcu *mcu, uint8_t port)
+{
+	uint8_t cmd[] = { PORT_GET_COUNTERS, 0x00, port };
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
+static int poe_reply_port_counters(struct mcu_state *state, uint8_t *reply)
+{
+	unsigned int port_idx = reply[2];
+
+	if (port_idx > state->num_detected_ports) {
+		ULOG_WARN("Invalid port in counters reply (port=%d)\n", port_idx);
+		return -EPROTO;
+	}
+
+	state->ports[port_idx].cnt_overload = reply[3];
+	state->ports[port_idx].cnt_short = reply[4];
+	state->ports[port_idx].cnt_denied = reply[5];
+	state->ports[port_idx].cnt_mps_absent = reply[6];
+
 	return 0;
 }
 
@@ -744,9 +789,11 @@ static poe_reply_handler reply_handler[] = {
 	[PORT_SET_PRIORITY]             = poe_reply_4_port,
 	[MCU_GET_SYSTEM_INFO]		= poe_reply_status,
 	[MCU_GET_POWER_STATS]		= poe_reply_power_stats,
+	[MCU_GET_PSE_POWER]		= poe_reply_pse_power,
 	[PORT_GET_STATUS]		= poe_reply_port_status,
 	[PORT_GET_SHORT_STATUS]		= poe_reply_4_port_status,
 	[PORT_GET_POWER_STATS]		= poe_reply_port_power_stats,
+	[PORT_GET_COUNTERS]		= poe_reply_port_counters,
 	[PORT_GET_CONFIG]		= poe_reply_port_config,
 	[PORT_GET_EXT_CONFIG]		= poe_reply_port_ext_config,
 	[MCU_GET_EXT_CONFIG]		= poe_reply_extended_config,
@@ -803,7 +850,7 @@ static int mcu_handle_reply(struct mcu *mcu, uint8_t *reply)
 	enum poe_cmd command;
 
 	uloop_timeout_cancel(&mcu->response_timeout);
-	log_packet(LOG_NOTICE, "RX <-", reply);
+	log_packet(LOG_DEBUG, "RX <-", reply);
 
 	if (list_empty(&mcu->pending_cmds)) {
 		ULOG_ERR("received unsolicited reply\n");
@@ -1028,6 +1075,7 @@ static void state_timeout_cb(struct uloop_timeout *t)
 	}
 
 	poe_cmd_power_stats(mcu);
+	poe_cmd_pse_power(mcu);
 	if (poe->hardcore_hacking_mode_en)
 		poe_cmd_get_extended_config(mcu);
 
@@ -1042,6 +1090,7 @@ static void state_timeout_cb(struct uloop_timeout *t)
 		if (poe->hardcore_hacking_mode_en) {
 			poe_cmd_port_status(mcu, i);
 			poe_cmd_port_config(mcu, i);
+			poe_cmd_port_counters(mcu, i);
 		}
 
 		poe_cmd_port_power_stats(mcu, i);
@@ -1071,6 +1120,7 @@ static int ubus_poe_info_cb(struct ubus_context *ctx, struct ubus_object *obj,
 		blobmsg_add_string(b, "mcu", state->sys_mcu);
 	blobmsg_add_double(b, "budget", cfg->budget);
 	blobmsg_add_double(b, "consumption", state->power_consumption);
+	blobmsg_add_double(b, "allocated", state->allocated_power);
 
 	c = blobmsg_open_table(b, "ports");
 	for (i = 0; i < cfg->port_count; i++) {
@@ -1091,6 +1141,12 @@ static int ubus_poe_info_cb(struct ubus_context *ctx, struct ubus_object *obj,
 			blobmsg_add_string(b, "status", "unknown");
 		if (state->ports[i].watt)
 			blobmsg_add_double(b, "consumption", state->ports[i].watt);
+		if (state->ports[i].voltage)
+			blobmsg_add_double(b, "voltage_mv", state->ports[i].voltage);
+		if (state->ports[i].current)
+			blobmsg_add_u32(b, "current_ma", (uint32_t)state->ports[i].current);
+		if (state->ports[i].temperature)
+			blobmsg_add_double(b, "temperature_c", state->ports[i].temperature);
 		blobmsg_add_u32(b, "power_limit_type", state->ports[i].power_limit_type);
 		if (state->ports[i].power_budget)
 			blobmsg_add_double(b, "power_budget", state->ports[i].power_budget);
@@ -1146,6 +1202,9 @@ static int ubus_poe_debug_cb(struct ubus_context *ctx, struct ubus_object *obj,
 		blobmsg_add_u32(b, "priority", state->ports[i].priority);
 		blobmsg_add_u32(b, "primary_pse_output", state->ports[i].primary_pse_output);
 		blobmsg_add_u32(b, "mapping", state->ports[i].mapping);
+		blobmsg_add_double(b, "voltage_mv", state->ports[i].voltage);
+		blobmsg_add_u32(b, "current_ma", (uint32_t)state->ports[i].current);
+		blobmsg_add_double(b, "temperature_c", state->ports[i].temperature);
 
 		if (state->ports[i].has_config_info) {
 			blobmsg_add_u32(b, "enabled", state->ports[i].enabled);
@@ -1160,6 +1219,16 @@ static int ubus_poe_debug_cb(struct ubus_context *ctx, struct ubus_object *obj,
 			blobmsg_add_u32(b, "class_info", state->ports[i].class_info);
 			blobmsg_add_u32(b, "pd_type", state->ports[i].pd_type);
 			blobmsg_add_u32(b, "mpss_mask", state->ports[i].mpss_mask);
+		}
+
+		if (state->ports[i].cnt_overload || state->ports[i].cnt_short ||
+		    state->ports[i].cnt_denied || state->ports[i].cnt_mps_absent) {
+			void *ctrs = blobmsg_open_table(b, "counters");
+			blobmsg_add_u32(b, "overload", state->ports[i].cnt_overload);
+			blobmsg_add_u32(b, "short", state->ports[i].cnt_short);
+			blobmsg_add_u32(b, "denied", state->ports[i].cnt_denied);
+			blobmsg_add_u32(b, "mps_absent", state->ports[i].cnt_mps_absent);
+			blobmsg_close_table(b, ctrs);
 		}
 
 		blobmsg_close_table(b, p);
