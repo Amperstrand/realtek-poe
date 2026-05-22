@@ -972,6 +972,10 @@ static int poe_port_setup(struct mcu* mcu, const struct config *cfg)
 			poe_cmd_port_power_budget(mcu, i, budget);
 		} else if (cfg->ports[i].power_budget) {
 			poe_cmd_port_power_budget(mcu, i, cfg->ports[i].power_budget);
+		} else {
+			/* Ensure MCU starts with class-default budget (15.4W)
+			 * rather than retaining stale values */
+			poe_cmd_port_power_budget(mcu, i, 77);
 		}
 	}
 
@@ -1325,6 +1329,15 @@ static int ubus_poe_set_port_config_cb(struct ubus_context *ctx,
 				return UBUS_STATUS_INVALID_ARGUMENT;
 			poe_cmd_port_power_limit_type(&poe->mcu, port_ids,
 						      limit_types);
+
+			/* MCU retains stale budget across limit_type changes;
+			 * clear it by sending 15.4W class-3 max (77 × 0.2W) */
+			if (limit_type == 1 && !tb[4])
+				poe_cmd_port_power_budget(&poe->mcu, i, 77);
+
+			poe->config.ports[i].power_limit_type = limit_type;
+			if (limit_type != 2)
+				poe->config.ports[i].power_limit_mw = 0;
 		}
 
 		if (tb[4]) {
@@ -1337,6 +1350,7 @@ static int ubus_poe_set_port_config_cb(struct ubus_context *ctx,
 			if (!budget)
 				budget = 1;
 			poe_cmd_port_power_budget(&poe->mcu, i, budget);
+			poe->config.ports[i].power_limit_mw = limit_mw;
 		}
 
 		return UBUS_STATUS_OK;
