@@ -683,6 +683,7 @@ static int poe_reply_port_ext_config(struct mcu_state *state, uint8_t *reply)
 	/* In the realtek dialect, mapping comes from a different byte. */
 	if (reply[8] != 0xff)
 		port->mapping = reply[8];
+	port->primary_power_limit = reply[9];
 
 	return 0;
 }
@@ -804,6 +805,22 @@ static int poe_reply_port_counters(struct mcu_state *state, uint8_t *reply)
 	return 0;
 }
 
+/* 0x05 - Clear counters */
+static int poe_cmd_clear_counters(struct mcu *mcu)
+{
+	uint8_t cmd[] = { MCU_CLEAR_COUNTERS, 0x00, 0x01 };
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
+static int poe_reply_clear_counters(struct mcu_state *state, uint8_t *reply)
+{
+	if (reply[2])
+		ULOG_WARN("Counter clear failed: %u\n", reply[2]);
+
+	return 0;
+}
+
 static int poe_reply_4_port(struct mcu_state *mcu, uint8_t *reply)
 {
 	uint8_t port, ret;
@@ -841,6 +858,7 @@ static poe_reply_handler reply_handler[] = {
 	[PORT_GET_EXT_CONFIG]		= poe_reply_port_ext_config,
 	[MCU_GET_EXT_CONFIG]		= poe_reply_extended_config,
 	[MCU_GET_POWER_MGMT]		= poe_reply_power_mgmt,
+	[MCU_CLEAR_COUNTERS]		= poe_reply_clear_counters,
 };
 
 static void mcu_clear_timeout(struct uloop_timeout *t)
@@ -1261,6 +1279,7 @@ static int ubus_poe_debug_cb(struct ubus_context *ctx, struct ubus_object *obj,
 		blobmsg_add_double(b, "power_budget", state->ports[i].power_budget);
 		blobmsg_add_u32(b, "priority", state->ports[i].priority);
 		blobmsg_add_u32(b, "primary_pse_output", state->ports[i].primary_pse_output);
+		blobmsg_add_u32(b, "primary_power_limit", state->ports[i].primary_power_limit);
 		blobmsg_add_u32(b, "mapping", state->ports[i].mapping);
 		blobmsg_add_double(b, "voltage_mv", state->ports[i].voltage);
 		blobmsg_add_u32(b, "current_ma", (uint32_t)state->ports[i].current);
@@ -1400,6 +1419,8 @@ static int ubus_poe_manage_cb(struct ubus_context *ctx, struct ubus_object *obj,
 		enable = true;
 	else if (!strcmp(action, "disable"))
 		enable = false;
+	else if (!strcmp(action, "clear_counters"))
+		return poe_cmd_clear_counters(mcu);
 	else
 		return UBUS_STATUS_INVALID_ARGUMENT;
 

@@ -36,6 +36,8 @@ enum poe_cmd {
 	PORT_SET_POWER_LIMIT,
 	PORT_SET_AUTO_POWERUP,
 
+	MCU_CLEAR_COUNTERS,
+
 	MCU_GET_SYSTEM_INFO,
 	MCU_GET_POWER_STATS,
 	MCU_GET_EXT_CONFIG,
@@ -73,6 +75,7 @@ struct port_state {
 	uint8_t power_limit_type;
 	uint8_t priority;
 	uint8_t primary_pse_output;
+	uint8_t primary_power_limit;
 	uint8_t mapping;
 
 	uint8_t enabled;
