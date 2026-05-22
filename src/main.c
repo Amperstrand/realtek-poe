@@ -63,7 +63,8 @@ static struct poe_ctx *ubus_to_poe_ctx(struct ubus_context *u)
 static void load_port_config(struct config *cfg, struct uci_context *uci,
 			     struct uci_section *s)
 {
-	const char * name, *id_str, *enable, *priority, *poe_plus;
+	const char *name, *id_str, *enable, *priority, *poe_plus;
+	const char *power_limit_type_str, *power_limit_str, *poe_type;
 	unsigned long id;
 
 	id_str = uci_lookup_option_string(uci, s, "id");
@@ -71,6 +72,9 @@ static void load_port_config(struct config *cfg, struct uci_context *uci,
 	enable = uci_lookup_option_string(uci, s, "enable");
 	priority = uci_lookup_option_string(uci, s, "priority");
 	poe_plus = uci_lookup_option_string(uci, s, "poe_plus");
+	poe_type = uci_lookup_option_string(uci, s, "poe_type");
+	power_limit_type_str = uci_lookup_option_string(uci, s, "power_limit_type");
+	power_limit_str = uci_lookup_option_string(uci, s, "power_limit");
 
 	if (!id_str || !name) {
 		ULOG_ERR("invalid port with missing name and id");
@@ -92,8 +96,30 @@ static void load_port_config(struct config *cfg, struct uci_context *uci,
 	if (cfg->ports[id].priority > 3)
 		cfg->ports[id].priority = 3;
 
-	if (poe_plus && !strcmp(poe_plus, "1"))
+	cfg->ports[id].power_limit_type = power_limit_type_str ?
+		strtoul(power_limit_type_str, NULL, 0) : 1;
+	if (cfg->ports[id].power_limit_type > 2)
+		cfg->ports[id].power_limit_type = 1;
+
+	cfg->ports[id].power_limit_mw = power_limit_str ?
+		strtoul(power_limit_str, NULL, 0) : 0;
+	if (cfg->ports[id].power_limit_mw > 33000)
+		cfg->ports[id].power_limit_mw = 33000;
+
+	if (poe_type) {
+		if (!strcmp(poe_type, "802.3af"))
+			cfg->ports[id].power_up_mode = 1;
+		else if (!strcmp(poe_type, "802.3at"))
+			cfg->ports[id].power_up_mode = 3;
+		else if (!strcmp(poe_type, "legacy"))
+			cfg->ports[id].power_up_mode = 0;
+		else if (!strcmp(poe_type, "pre-802.3at"))
+			cfg->ports[id].power_up_mode = 2;
+		else
+			cfg->ports[id].power_up_mode = strtoul(poe_type, NULL, 0);
+	} else if (poe_plus && !strcmp(poe_plus, "1")) {
 		cfg->ports[id].power_up_mode = 3;
+	}
 }
 
 static void warn_unsupported_config(const char *cfg_name)
@@ -900,7 +926,8 @@ static int poet_setup(struct mcu* mcu, const struct port_config *ports,
 			port_ids[num_okay] = i;
 			priorities[num_okay] = ports[i].priority;
 			powerup_mode[num_okay] = ports[i].power_up_mode;
-			limit_type[num_okay] = (ports[i].power_budget) ? 2 : 1;
+			limit_type[num_okay] = ports[i].power_limit_mw ?
+			2 : ports[i].power_limit_type;
 
 			if (++num_okay == 4)
 				break;
@@ -933,10 +960,19 @@ static int poe_port_setup(struct mcu* mcu, const struct config *cfg)
 	poe_cmd_port_detection_type(mcu, PORT_ID_ALL, 3);
 
 	for (i = 0; i < cfg->port_count; i++) {
-		if (!cfg->ports[i].enable || !cfg->ports[i].power_budget)
+		uint8_t budget;
+
+		if (!cfg->ports[i].enable)
 			continue;
 
-		poe_cmd_port_power_budget(mcu, i, cfg->ports[i].power_budget);
+		if (cfg->ports[i].power_limit_mw) {
+			budget = cfg->ports[i].power_limit_mw / 200;
+			if (!budget)
+				budget = 1;
+			poe_cmd_port_power_budget(mcu, i, budget);
+		} else if (cfg->ports[i].power_budget) {
+			poe_cmd_port_power_budget(mcu, i, cfg->ports[i].power_budget);
+		}
 	}
 
 	poet_setup(mcu, cfg->ports, cfg->port_count);
@@ -1051,6 +1087,9 @@ static int ubus_poe_info_cb(struct ubus_context *ctx, struct ubus_object *obj,
 			blobmsg_add_string(b, "status", "unknown");
 		if (state->ports[i].watt)
 			blobmsg_add_double(b, "consumption", state->ports[i].watt);
+		blobmsg_add_u32(b, "power_limit_type", state->ports[i].power_limit_type);
+		if (state->ports[i].power_budget)
+			blobmsg_add_double(b, "power_budget", state->ports[i].power_budget);
 
 		blobmsg_close_table(b, p);
 	}
@@ -1228,12 +1267,92 @@ static int ubus_poe_manage_cb(struct ubus_context *ctx, struct ubus_object *obj,
 	return UBUS_STATUS_OK;
 }
 
+static const struct blobmsg_policy ubus_poe_set_port_config_policy[] = {
+	{ "port", BLOBMSG_TYPE_STRING },
+	{ "enable", BLOBMSG_TYPE_BOOL },
+	{ "priority", BLOBMSG_TYPE_INT32 },
+	{ "power_limit_type", BLOBMSG_TYPE_INT32 },
+	{ "power_limit", BLOBMSG_TYPE_INT32 },
+};
+
+static int ubus_poe_set_port_config_cb(struct ubus_context *ctx,
+					struct ubus_object *obj,
+					struct ubus_request_data *req,
+					const char *method,
+					struct blob_attr *msg)
+{
+	struct poe_ctx *poe = ubus_to_poe_ctx(ctx);
+	struct blob_attr *tb[ARRAY_SIZE(ubus_poe_set_port_config_policy)];
+	struct blob_attr *attr;
+	const char *port_name;
+	size_t i;
+
+	blobmsg_parse(ubus_poe_set_port_config_policy,
+		      ARRAY_SIZE(ubus_poe_set_port_config_policy),
+		      tb, blob_data(msg), blob_len(msg));
+
+	attr = tb[0];
+	if (!attr)
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	port_name = blobmsg_get_string(attr);
+
+	for (i = 0; i < poe->config.port_count; i++) {
+		if (!poe->config.ports[i].valid)
+			continue;
+		if (strcmp(poe->config.ports[i].name, port_name))
+			continue;
+
+		if (tb[1])
+			poe_cmd_port_enable(&poe->mcu, i, blobmsg_get_bool(tb[1]));
+
+		if (tb[2]) {
+			uint8_t prio = blobmsg_get_u32(tb[2]);
+			uint8_t port_ids[4] = {i, 0xff, 0xff, 0xff};
+			uint8_t priorities[4] = {prio, 0xff, 0xff, 0xff};
+
+			if (prio > 3)
+				return UBUS_STATUS_INVALID_ARGUMENT;
+			poe_set_port_priority(&poe->mcu, port_ids, priorities);
+		}
+
+		if (tb[3]) {
+			uint8_t limit_type = blobmsg_get_u32(tb[3]);
+			uint8_t port_ids[4] = {i, 0xff, 0xff, 0xff};
+			uint8_t limit_types[4] = {limit_type, 0xff, 0xff, 0xff};
+
+			if (limit_type > 2)
+				return UBUS_STATUS_INVALID_ARGUMENT;
+			poe_cmd_port_power_limit_type(&poe->mcu, port_ids,
+						      limit_types);
+		}
+
+		if (tb[4]) {
+			uint32_t limit_mw = blobmsg_get_u32(tb[4]);
+			uint8_t budget;
+
+			if (limit_mw > 33000)
+				return UBUS_STATUS_INVALID_ARGUMENT;
+			budget = limit_mw / 200;
+			if (!budget)
+				budget = 1;
+			poe_cmd_port_power_budget(&poe->mcu, i, budget);
+		}
+
+		return UBUS_STATUS_OK;
+	}
+
+	return UBUS_STATUS_NOT_FOUND;
+}
+
 static const struct ubus_method ubus_poe_methods[] = {
 	UBUS_METHOD_NOARG("info", ubus_poe_info_cb),
 	UBUS_METHOD_NOARG("debug", ubus_poe_debug_cb),
 	UBUS_METHOD_NOARG("reload", ubus_poe_reload_cb),
 	UBUS_METHOD("sendframe", ubus_poe_sendframe_cb, ubus_poe_sendframe_policy),
 	UBUS_METHOD("manage", ubus_poe_manage_cb, ubus_poe_manage_policy),
+	UBUS_METHOD("set_port_config", ubus_poe_set_port_config_cb,
+		    ubus_poe_set_port_config_policy),
 };
 
 static struct ubus_object_type ubus_poe_object_type =

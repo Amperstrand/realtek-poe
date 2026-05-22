@@ -114,6 +114,8 @@ struct port_config {
 	uint8_t priority;
 	uint8_t power_up_mode;
 	uint8_t power_budget;
+	uint8_t power_limit_type;	/* 0=None, 1=Class-based, 2=User-defined */
+	uint16_t power_limit_mw;	/* User-defined limit in mW (only when type=2) */
 };
 
 struct dialect_desc;
