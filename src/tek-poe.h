@@ -116,6 +116,10 @@ struct mcu_state {
 	uint8_t ddflag;
 	uint8_t num_pse;
 
+	uint8_t pse_id;
+	uint8_t high_power;
+	uint8_t gb_hysteresis;
+
 	struct port_state ports[MAX_PORT];
 };
 

@@ -556,23 +556,43 @@ static int poe_reply_power_stats(struct mcu_state *state, uint8_t *reply)
 {
 	state->power_consumption = read16_be(reply + 2) * 0.1;
 	state->reported_power_budget = read16_be(reply + 4) * 0.1;
+	state->pse_id = reply[6];
+	state->high_power = reply[7];
+	state->gb_hysteresis = reply[10];
 
 	return 0;
 }
 
-/* 0x29 - Get all PSE output consumed power */
-static int poe_cmd_pse_power(struct mcu *mcu)
+/* 0x29 - Get all PSE output consumed power
+ *	Request format: { [pse_output] 01 } pairs, up to 4 pairs per frame
+ *	Response format: { [pse_output] [consumed_power] } pairs
+ *	consumed_power is in units of 0.2W
+ */
+static int poe_cmd_pse_power(struct mcu *mcu, uint8_t p1, uint8_t p2,
+			     uint8_t p3, uint8_t p4)
 {
-	uint8_t cmd[] = { MCU_GET_PSE_POWER };
+	uint8_t cmd[] = { MCU_GET_PSE_POWER, 0x00,
+			  p1, 1, p2, 1, p3, 1, p4, 1 };
 
 	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
 }
 
 static int poe_reply_pse_power(struct mcu_state *state, uint8_t *reply)
 {
-	uint16_t raw = read16_be(reply + 2);
-	if (raw != 0xffff)
-		state->allocated_power = raw * 0.2;
+	float total = 0;
+	int i;
+
+	for (i = 2; i < OFFSET_CHECKSUM; i += 2) {
+		uint8_t pse_output = reply[i];
+		uint8_t consumed = reply[i + 1];
+
+		if (pse_output == 0xff)
+			continue;
+
+		total += consumed * 0.2;
+	}
+
+	state->allocated_power += total;
 
 	return 0;
 }
@@ -757,6 +777,7 @@ static int poe_reply_port_counters(struct mcu_state *state, uint8_t *reply)
 	state->ports[port_idx].cnt_short = reply[4];
 	state->ports[port_idx].cnt_denied = reply[5];
 	state->ports[port_idx].cnt_mps_absent = reply[6];
+	state->ports[port_idx].cnt_invalid_signature = reply[7];
 
 	return 0;
 }
@@ -1075,7 +1096,13 @@ static void state_timeout_cb(struct uloop_timeout *t)
 	}
 
 	poe_cmd_power_stats(mcu);
-	poe_cmd_pse_power(mcu);
+	mcu->state.allocated_power = 0;
+	if (cfg->port_count <= 4) {
+		poe_cmd_pse_power(mcu, 0, 1, 2, 3);
+	} else {
+		poe_cmd_pse_power(mcu, 0, 1, 2, 3);
+		poe_cmd_pse_power(mcu, 4, 5, 6, 7);
+	}
 	if (poe->hardcore_hacking_mode_en)
 		poe_cmd_get_extended_config(mcu);
 
@@ -1174,6 +1201,9 @@ static int ubus_poe_debug_cb(struct ubus_context *ctx, struct ubus_object *obj,
 	blob_buf_init(b, 0);
 
 	blobmsg_add_double(b, "reported_budget", state->reported_power_budget);
+	blobmsg_add_u32(b, "pse_id", state->pse_id);
+	blobmsg_add_u32(b, "high_power", state->high_power);
+	blobmsg_add_u32(b, "gb_hysteresis", state->gb_hysteresis);
 
 
 	blobmsg_add_u32(b, "num_detected_ports", state->num_detected_ports);
@@ -1222,12 +1252,14 @@ static int ubus_poe_debug_cb(struct ubus_context *ctx, struct ubus_object *obj,
 		}
 
 		if (state->ports[i].cnt_overload || state->ports[i].cnt_short ||
-		    state->ports[i].cnt_denied || state->ports[i].cnt_mps_absent) {
+		    state->ports[i].cnt_denied || state->ports[i].cnt_mps_absent ||
+		    state->ports[i].cnt_invalid_signature) {
 			void *ctrs = blobmsg_open_table(b, "counters");
 			blobmsg_add_u32(b, "overload", state->ports[i].cnt_overload);
 			blobmsg_add_u32(b, "short", state->ports[i].cnt_short);
 			blobmsg_add_u32(b, "denied", state->ports[i].cnt_denied);
 			blobmsg_add_u32(b, "mps_absent", state->ports[i].cnt_mps_absent);
+			blobmsg_add_u32(b, "invalid_signature", state->ports[i].cnt_invalid_signature);
 			blobmsg_close_table(b, ctrs);
 		}
 
