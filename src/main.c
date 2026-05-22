@@ -53,6 +53,11 @@ struct poe_ctx {
 	struct uloop_timeout state_timeout;
 	unsigned int hardcore_hacking_mode_en : 1;
 	unsigned int threshold_over_active : 1;
+
+	/* Snapshot of last reported per-port status for edge-triggered events. */
+	const char *last_port_status[MAX_PORT];
+	uint8_t last_port_class[MAX_PORT];
+	unsigned int port_status_initialized : 1;
 };
 
 static struct poe_ctx *ubus_to_poe_ctx(struct ubus_context *u)
@@ -1168,6 +1173,53 @@ static void poe_check_power_threshold(struct poe_ctx *poe)
 	ubus_send_event(&poe->conn.ctx, "poe.power_threshold", b->head);
 }
 
+static void poe_check_port_status_changes(struct poe_ctx *poe)
+{
+	const struct mcu_state *state = &poe->mcu.state;
+	const struct config *cfg = &poe->config;
+	struct blob_buf *b = &poe->blob_buf;
+	unsigned int i;
+
+	if (!poe->port_status_initialized) {
+		for (i = 0; i < cfg->port_count && i < MAX_PORT; i++) {
+			poe->last_port_status[i] = state->ports[i].status;
+			poe->last_port_class[i] = state->ports[i].class_info;
+		}
+		poe->port_status_initialized = 1;
+		return;
+	}
+
+	for (i = 0; i < cfg->port_count && i < MAX_PORT; i++) {
+		const char *cur = state->ports[i].status;
+		const char *prev = poe->last_port_status[i];
+		uint8_t cur_cls = state->ports[i].class_info;
+		uint8_t prev_cls = poe->last_port_class[i];
+		int status_changed = (cur != prev) && (!cur || !prev || strcmp(cur, prev));
+		int class_changed = cur_cls != prev_cls;
+
+		if (!status_changed && !class_changed)
+			continue;
+
+		ULOG_INFO("Port %s status: %s -> %s (class %d -> %d)\n",
+			  cfg->ports[i].name,
+			  prev ? prev : "(none)", cur ? cur : "(none)",
+			  prev_cls, cur_cls);
+
+		blob_buf_init(b, 0);
+		blobmsg_add_string(b, "port", cfg->ports[i].name);
+		blobmsg_add_u32(b, "index", i + 1);
+		blobmsg_add_string(b, "status", cur ? cur : "");
+		blobmsg_add_string(b, "prev_status", prev ? prev : "");
+		blobmsg_add_u32(b, "class", cur_cls);
+		blobmsg_add_u32(b, "prev_class", prev_cls);
+		blobmsg_add_double(b, "watt", state->ports[i].watt);
+		ubus_send_event(&poe->conn.ctx, "poe.port_status", b->head);
+
+		poe->last_port_status[i] = cur;
+		poe->last_port_class[i] = cur_cls;
+	}
+}
+
 static void state_timeout_cb(struct uloop_timeout *t)
 {
 	struct poe_ctx *poe = container_of(t, struct poe_ctx, state_timeout);
@@ -1182,6 +1234,7 @@ static void state_timeout_cb(struct uloop_timeout *t)
 	}
 
 	poe_check_power_threshold(poe);
+	poe_check_port_status_changes(poe);
 
 	poe_cmd_power_stats(mcu);
 	mcu->state.allocated_power = 0;
