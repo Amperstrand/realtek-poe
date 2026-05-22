@@ -1240,7 +1240,7 @@ static int ubus_poe_reload_cb(struct ubus_context *ctx, struct ubus_object *obj,
 
 static const struct blobmsg_policy ubus_poe_manage_policy[] = {
 	{ "port", BLOBMSG_TYPE_STRING },
-	{ "enable", BLOBMSG_TYPE_BOOL },
+	{ "action", BLOBMSG_TYPE_STRING },
 };
 
 static int ubus_poe_manage_cb(struct ubus_context *ctx, struct ubus_object *obj,
@@ -1252,7 +1252,8 @@ static int ubus_poe_manage_cb(struct ubus_context *ctx, struct ubus_object *obj,
 	const struct config *cfg = &poe->config;
 	const struct port_config *port;
 	struct mcu *mcu = &poe->mcu;
-	const char *port_name;
+	const char *port_name, *action;
+	bool enable;
 	size_t i;
 
 	blobmsg_parse(ubus_poe_manage_policy,
@@ -1262,11 +1263,20 @@ static int ubus_poe_manage_cb(struct ubus_context *ctx, struct ubus_object *obj,
 		return UBUS_STATUS_INVALID_ARGUMENT;
 
 	port_name = blobmsg_get_string(tb[0]);
+	action = blobmsg_get_string(tb[1]);
+
+	if (!strcmp(action, "enable"))
+		enable = true;
+	else if (!strcmp(action, "disable"))
+		enable = false;
+	else
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
 	for (i = 0; i < cfg->port_count; i++) {
 		port = &cfg->ports[i];
 		if (!port->enable || strcmp(port_name, port->name))
 			continue;
-		return poe_cmd_port_enable(mcu, i, blobmsg_get_bool(tb[1]));
+		return poe_cmd_port_enable(mcu, i, enable);
 	}
 	return UBUS_STATUS_OK;
 }
