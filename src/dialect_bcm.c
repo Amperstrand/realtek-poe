@@ -25,6 +25,7 @@ static const struct dialect_map_entry bcm_dialect_mapping[] = {
 	[PORT_GET_POWER_STATS]		= {0x30, 1},
 	[MCU_GET_PSE_POWER]		= {0x29, 1},
 	[PORT_GET_COUNTERS]		= {0x22, 1},
+	[MCU_GET_POWER_MGMT]		= {0x27, 1},
 };
 
 static const struct dialect_map bcm_dialect_map = {

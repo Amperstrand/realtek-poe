@@ -46,6 +46,7 @@ enum poe_cmd {
 	PORT_GET_POWER_STATS,
 	MCU_GET_PSE_POWER,
 	PORT_GET_COUNTERS,
+	MCU_GET_POWER_MGMT,
 	CMD_MAX
 };
 
@@ -119,6 +120,10 @@ struct mcu_state {
 	uint8_t pse_id;
 	uint8_t high_power;
 	uint8_t gb_hysteresis;
+
+	uint8_t pm_mode;
+	float pm_power_limit[2];
+	float pm_guard_band[2];
 
 	struct port_state ports[MAX_PORT];
 };

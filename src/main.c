@@ -597,6 +597,28 @@ static int poe_reply_pse_power(struct mcu_state *state, uint8_t *reply)
 	return 0;
 }
 
+/* 0x27 - Get power management mode
+ *	Reply: [mode] [power_limit_0 2B] [guard_band_0 2B] [power_limit_1 2B] [guard_band_1 2B]
+ *	Units of 0.1W for power_limit/guard_band. Request specifies PSE index.
+ */
+static int poe_cmd_power_mgmt(struct mcu *mcu, uint8_t pse)
+{
+	uint8_t cmd[] = { MCU_GET_POWER_MGMT, 0x00, pse };
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
+static int poe_reply_power_mgmt(struct mcu_state *state, uint8_t *reply)
+{
+	state->pm_mode = reply[2];
+	state->pm_power_limit[0] = read16_be(reply + 3) * 0.1;
+	state->pm_guard_band[0] = read16_be(reply + 5) * 0.1;
+	state->pm_power_limit[1] = read16_be(reply + 7) * 0.1;
+	state->pm_guard_band[1] = read16_be(reply + 9) * 0.1;
+
+	return 0;
+}
+
 /* 0x25 - Get port config */
 static int poe_cmd_port_config(struct mcu *mcu, uint8_t port)
 {
@@ -818,6 +840,7 @@ static poe_reply_handler reply_handler[] = {
 	[PORT_GET_CONFIG]		= poe_reply_port_config,
 	[PORT_GET_EXT_CONFIG]		= poe_reply_port_ext_config,
 	[MCU_GET_EXT_CONFIG]		= poe_reply_extended_config,
+	[MCU_GET_POWER_MGMT]		= poe_reply_power_mgmt,
 };
 
 static void mcu_clear_timeout(struct uloop_timeout *t)
@@ -1103,8 +1126,10 @@ static void state_timeout_cb(struct uloop_timeout *t)
 		poe_cmd_pse_power(mcu, 0, 1, 2, 3);
 		poe_cmd_pse_power(mcu, 4, 5, 6, 7);
 	}
-	if (poe->hardcore_hacking_mode_en)
+	if (poe->hardcore_hacking_mode_en) {
 		poe_cmd_get_extended_config(mcu);
+		poe_cmd_power_mgmt(mcu, 0);
+	}
 
 	if (mcu->dialect.desc->ops->poll_async) {
 		mcu->dialect.desc->ops->poll_async(mcu, cfg);
@@ -1204,6 +1229,11 @@ static int ubus_poe_debug_cb(struct ubus_context *ctx, struct ubus_object *obj,
 	blobmsg_add_u32(b, "pse_id", state->pse_id);
 	blobmsg_add_u32(b, "high_power", state->high_power);
 	blobmsg_add_u32(b, "gb_hysteresis", state->gb_hysteresis);
+	blobmsg_add_u32(b, "pm_mode", state->pm_mode);
+	blobmsg_add_double(b, "pm_power_limit_0", state->pm_power_limit[0]);
+	blobmsg_add_double(b, "pm_guard_band_0", state->pm_guard_band[0]);
+	blobmsg_add_double(b, "pm_power_limit_1", state->pm_power_limit[1]);
+	blobmsg_add_double(b, "pm_guard_band_1", state->pm_guard_band[1]);
 
 
 	blobmsg_add_u32(b, "num_detected_ports", state->num_detected_ports);
