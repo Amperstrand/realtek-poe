@@ -32,11 +32,14 @@ enum poe_cmd {
 	PORT_SET_PRIORITY,
 	PORT_SET_POE_MODE,
 	PORT_SET_DISCONNECT_TYPE,
+	PORT_RESET,
 	PORT_SET_POWER_LIMIT_TYPE,
 	PORT_SET_POWER_LIMIT,
 	PORT_SET_AUTO_POWERUP,
 
 	MCU_CLEAR_COUNTERS,
+	MCU_SET_DEVICE_POWER_MGMT,
+	MCU_SET_HIGH_POWER_LIMIT,
 
 	MCU_GET_SYSTEM_INFO,
 	MCU_GET_POWER_STATS,
@@ -85,9 +88,13 @@ struct port_state {
 	uint8_t disconnect_type;
 	uint8_t pair;
 
+	uint8_t fault_type;
 	uint8_t class_info;
 	uint8_t pd_type;
 	uint8_t mpss_mask;
+	uint8_t power_mode;
+	uint8_t chan_pwr;
+	uint8_t pd_alt;
 
 	uint16_t cnt_overload;
 	uint16_t cnt_short;

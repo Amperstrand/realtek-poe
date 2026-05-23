@@ -12,9 +12,12 @@ static const struct dialect_map_entry bcm_dialect_mapping[] = {
 	[PORT_SET_PRIORITY]		= {0x1a, CMD_IS_4PORT},
 	[PORT_SET_POE_MODE]		= {0x1c, CMD_IS_4PORT},
 	[PORT_SET_DISCONNECT_TYPE]	= {0x13, CMD_HAS_ALL_PORT},
+	[PORT_RESET]			= {0x03, 1},
 	[PORT_SET_POWER_LIMIT_TYPE]	= {0x15, CMD_IS_4PORT},
 	[PORT_SET_POWER_LIMIT]		= {0x16, 1},
 	[MCU_CLEAR_COUNTERS]		= {0x05, 1},
+	[MCU_SET_DEVICE_POWER_MGMT]	= {0x0b, 1},
+	[MCU_SET_HIGH_POWER_LIMIT]	= {0x07, 1},
 
 	[MCU_GET_SYSTEM_INFO]		= {0x20, 1},
 	[MCU_GET_POWER_STATS]		= {0x23, 1},

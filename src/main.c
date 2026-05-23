@@ -357,6 +357,15 @@ static int poe_cmd_port_enable(struct mcu *mcu, uint8_t port, uint8_t enable)
 	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
 }
 
+/* 0x03 - Port reset (restart PSE output and re-detect PD).
+ * Stock: bcm59111_cmd_set enum 3 = 0x03, used to clear fault states. */
+static int poe_cmd_port_reset(struct mcu *mcu, uint8_t port)
+{
+	uint8_t cmd[] = { PORT_RESET, 0x00, port, 0x01 };
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
 static int poe_cmd_port_mapping_enable(struct mcu *mcu, bool enable)
 {
 	uint8_t cmd[] = { MCU_ENABLE_PORT_MAPPING, 0x00, enable };
@@ -555,9 +564,16 @@ static int poe_reply_port_status(struct mcu_state *state, uint8_t *reply)
 		return -EPROTO;
 	}
 
+	/* Stock: poe_bcm59111_portStatus_get extracts all 9 fields from the
+	 * 0x21 reply: [port] [state] [fault_type] [class_info] [pd_type]
+	 * [mpss_mask] [power_mode] [chan_pwr] [pd_alt] */
+	port->fault_type = reply[4];
 	port->class_info = reply[5];
 	port->pd_type = reply[6];
 	port->mpss_mask = reply[7];
+	port->power_mode = reply[8];
+	port->chan_pwr = reply[9];
+	port->pd_alt = reply[10];
 	port->has_detailed_state = 1;
 
 	return 0;
@@ -731,6 +747,8 @@ const char *port_short_status_to_str(uint8_t short_status)
 	return GET_STR(short_status & 0xf, status);
 }
 
+static int port_status_is_fault(const char *status);
+
 static int poe_reply_4_port_status(struct mcu_state *state, uint8_t *reply)
 {
 	int i, port, pstate;
@@ -747,6 +765,16 @@ static int poe_reply_4_port_status(struct mcu_state *state, uint8_t *reply)
 		}
 
 		state->ports[port].status = port_short_status_to_str(pstate);
+
+		/* Stock: poe_bcm59111_allPortStatus_get extracts packed bits.
+		 * [7] = IEEE PD flag, [6:4] = class (delivering) or fault_type,
+		 * [3:0] = port state (already decoded above). */
+		state->ports[port].pd_type = (pstate & 0x80) ? 1 : 0;
+		if (port_status_is_fault(state->ports[port].status)) {
+			state->ports[port].fault_type = (pstate >> 4) & 0x7;
+		} else {
+			state->ports[port].class_info = (pstate >> 4) & 0x7;
+		}
 	}
 
 	return 0;
@@ -798,10 +826,11 @@ static int poe_reply_port_power_stats(struct mcu_state *state, uint8_t *reply)
 	return 0;
 }
 
-/* 0x22 - Get port counters */
+/* 0x22 - Get port counters. Stock bcm59111_portStats_get sends reset=1
+ * to clear MCU single-byte counters after reading, preventing overflow. */
 static int poe_cmd_port_counters(struct mcu *mcu, uint8_t port)
 {
-	uint8_t cmd[] = { PORT_GET_COUNTERS, 0x00, port };
+	uint8_t cmd[] = { PORT_GET_COUNTERS, 0x00, port, 0x01 };
 
 	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
 }
@@ -838,6 +867,31 @@ static int poe_reply_clear_counters(struct mcu_state *state, uint8_t *reply)
 		ULOG_WARN("Counter clear failed: %u\n", reply[2]);
 
 	return 0;
+}
+
+/* 0x0b - Set device power management.
+ * Stock: poe_bcm59111_chip_init sends pre_alloc/powerup_mode/disconnect_order
+ * with gb_hysteresis to configure budget accounting mode. */
+static int poe_cmd_device_power_mgmt(struct mcu *mcu, uint8_t pre_alloc,
+				      uint8_t powerup_mode,
+				      uint8_t disconnect_order,
+				      uint8_t gb_hysteresis)
+{
+	uint8_t cmd[] = { MCU_SET_DEVICE_POWER_MGMT, 0x00,
+			  pre_alloc, powerup_mode, disconnect_order,
+			  0xff, 0xff, 0xff, 0xff, 0xff, gb_hysteresis };
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
+/* 0x07 - Set global port power limit (max per-port budget for class-based).
+ * Stock: bcm59111_cmd_set enum 7 = 0x07.
+ * high_power: 0=22.5W, 1=26.5W, 2=31.2W, 3=37.0W */
+static int poe_cmd_high_power_limit(struct mcu *mcu, uint8_t high_power)
+{
+	uint8_t cmd[] = { MCU_SET_HIGH_POWER_LIMIT, 0x00, high_power };
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
 }
 
 static int poe_reply_4_port(struct mcu_state *mcu, uint8_t *reply)
@@ -878,6 +932,9 @@ static poe_reply_handler reply_handler[] = {
 	[MCU_GET_EXT_CONFIG]		= poe_reply_extended_config,
 	[MCU_GET_POWER_MGMT]		= poe_reply_power_mgmt,
 	[MCU_CLEAR_COUNTERS]		= poe_reply_clear_counters,
+	[PORT_RESET]			= poe_reply_4_port,
+	[MCU_SET_DEVICE_POWER_MGMT]	= poe_reply_clear_counters,
+	[MCU_SET_HIGH_POWER_LIMIT]	= poe_reply_clear_counters,
 };
 
 static void mcu_clear_timeout(struct uloop_timeout *t)
@@ -1137,6 +1194,17 @@ static int poe_initial_setup(struct mcu* mcu, const struct config *cfg)
 	poe_cmd_port_mapping_enable(mcu, false);
 	poe_set_power_budget(mcu, cfg);
 
+	/* Stock: poe_bcm59111_chip_init sends 0x0b with pre_alloc=1
+	 * (actual usage), powerup_mode=0 (simultaneous),
+	 * disconnect_order=0 (overload first), and gb_hysteresis
+	 * derived from the guard band. */
+	poe_cmd_device_power_mgmt(mcu, 1, 0, 0,
+				   (uint8_t)(cfg->budget_guard * 10));
+
+	/* Stock: bcm59111_cmd_set enum 7 = 0x07. Sets max per-port power
+	 * for class-based limits. 802.3at class 4 = 31.2W (value 2). */
+	poe_cmd_high_power_limit(mcu, 2);
+
 	poe_port_setup(mcu, cfg);
 
 	return 0;
@@ -1185,6 +1253,23 @@ static int port_status_is_fault(const char *status)
 	return !strcmp(status, "Fault") || !strcmp(status, "Other fault");
 }
 
+/* Stock: 0x21 reply byte[4] fault_type enumeration.
+ * Maps directly to text_poe_portStatusDescStr in libsal.so. */
+static const char *fault_type_str(uint8_t fault_type)
+{
+	static const char *names[] = {
+		[0] = "ovlo",
+		[1] = "mps_absent",
+		[2] = "short",
+		[3] = "overload",
+		[4] = "denied",
+		[5] = "thermal",
+		[6] = "startup_failure",
+		[7] = "uvlo",
+	};
+	return GET_STR(fault_type, names);
+}
+
 static void poe_check_port_status_changes(struct poe_ctx *poe)
 {
 	const struct mcu_state *state = &poe->mcu.state;
@@ -1216,23 +1301,15 @@ static void poe_check_port_status_changes(struct poe_ctx *poe)
 		int class_changed = cur_cls != prev_cls;
 		int is_fault = port_status_is_fault(cur);
 		char fault_reason[128];
-		size_t fr = 0;
 
 		fault_reason[0] = '\0';
 		if (is_fault) {
-			/* Compose fault_reason from counters that ticked this cycle. */
-			#define APPEND_REASON(field, label) do { \
-				if (p->field != poe->last_##field[i]) \
-					fr += snprintf(fault_reason + fr, \
-						sizeof(fault_reason) - fr, \
-						"%s%s", fr ? "," : "", label); \
-			} while (0)
-			APPEND_REASON(cnt_overload, "overload");
-			APPEND_REASON(cnt_short, "short");
-			APPEND_REASON(cnt_denied, "denied");
-			APPEND_REASON(cnt_mps_absent, "mps_absent");
-			APPEND_REASON(cnt_invalid_signature, "invalid_signature");
-			#undef APPEND_REASON
+			const char *ft = fault_type_str(p->fault_type);
+			if (ft)
+				snprintf(fault_reason, sizeof(fault_reason), "%s", ft);
+			else
+				snprintf(fault_reason, sizeof(fault_reason),
+					 "unknown(%d)", p->fault_type);
 		}
 
 		if (status_changed || class_changed) {
@@ -1443,9 +1520,13 @@ static int ubus_poe_debug_cb(struct ubus_context *ctx, struct ubus_object *obj,
 		}
 
 		if (state->ports[i].has_detailed_state) {
+			blobmsg_add_u32(b, "fault_type", state->ports[i].fault_type);
 			blobmsg_add_u32(b, "class_info", state->ports[i].class_info);
 			blobmsg_add_u32(b, "pd_type", state->ports[i].pd_type);
 			blobmsg_add_u32(b, "mpss_mask", state->ports[i].mpss_mask);
+			blobmsg_add_u32(b, "power_mode", state->ports[i].power_mode);
+			blobmsg_add_u32(b, "chan_pwr", state->ports[i].chan_pwr);
+			blobmsg_add_u32(b, "pd_alt", state->ports[i].pd_alt);
 		}
 
 		if (state->ports[i].cnt_overload || state->ports[i].cnt_short ||
@@ -1569,7 +1650,15 @@ static int ubus_poe_manage_cb(struct ubus_context *ctx, struct ubus_object *obj,
 		enable = false;
 	else if (!strcmp(action, "clear_counters"))
 		return poe_cmd_clear_counters(mcu);
-	else
+	else if (!strcmp(action, "reset")) {
+		for (i = 0; i < cfg->port_count; i++) {
+			port = &cfg->ports[i];
+			if (!port->enable || strcmp(port_name, port->name))
+				continue;
+			return poe_cmd_port_reset(mcu, i);
+		}
+		return UBUS_STATUS_NOT_FOUND;
+	} else
 		return UBUS_STATUS_INVALID_ARGUMENT;
 
 	for (i = 0; i < cfg->port_count; i++) {
