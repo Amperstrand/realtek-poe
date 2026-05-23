@@ -1270,6 +1270,8 @@ static void poe_set_power_budget(struct mcu* mcu, const struct config *config)
 
 static int poe_initial_setup(struct mcu* mcu, const struct config *cfg)
 {
+	size_t i;
+
 	poe_cmd_status(mcu);
 	poe_cmd_power_mgmt_mode(mcu, 2);
 	poe_cmd_port_mapping_enable(mcu, false);
@@ -1287,6 +1289,16 @@ static int poe_initial_setup(struct mcu* mcu, const struct config *cfg)
 	poe_cmd_high_power_limit(mcu, 2);
 
 	poe_port_setup(mcu, cfg);
+
+	/* Stock: board_poe_led_init queries LED config once at init.
+	 * Previously in state_timeout_cb but MCU timeout drained the
+	 * entire pending queue, consistently dropping these trailing
+	 * commands. Query at init where the queue is uncontested.
+	 * Ref: Hurricos/realtek-poe#66 */
+	poe_cmd_port_led_config(mcu);
+	poe_cmd_system_led_config(mcu);
+	for (i = 0; i < cfg->port_count; i += 8)
+		poe_cmd_port_led_map(mcu, i);
 
 	return 0;
 }
@@ -1470,15 +1482,6 @@ static void state_timeout_cb(struct uloop_timeout *t)
 		}
 
 		poe_cmd_port_power_stats(mcu, i);
-	}
-
-	/* LED config: query once per cycle (only in debug mode to avoid
-	 * unnecessary MCU traffic). Stock queries these at init only. */
-	if (poe->hardcore_hacking_mode_en) {
-		poe_cmd_port_led_config(mcu);
-		poe_cmd_system_led_config(mcu);
-		for (i = 0; i < cfg->port_count; i += 8)
-			poe_cmd_port_led_map(mcu, i);
 	}
 
 	uloop_timeout_set(t, 2 * 1000);
@@ -1693,6 +1696,51 @@ ubus_poe_sendframe_cb(struct ubus_context *ctx, struct ubus_object *obj,
 
 	ret = mcu_queue_cmd(mcu, cmd, cmd_len);
 	return (ret < 0) ?  UBUS_STATUS_SYSTEM_ERROR : UBUS_STATUS_OK;
+}
+
+static const struct blobmsg_policy ubus_poe_rawframe_policy[] = {
+	{ "frame", BLOBMSG_TYPE_STRING },
+};
+
+static int
+ubus_poe_rawframe_cb(struct ubus_context *ctx, struct ubus_object *obj,
+		     struct ubus_request_data *req, const char *method,
+		     struct blob_attr *msg)
+{
+	struct blob_attr *tb[ARRAY_SIZE(ubus_poe_rawframe_policy)];
+	struct poe_ctx *poe = ubus_to_poe_ctx(ctx);
+	struct mcu *mcu = &poe->mcu;
+	char *frame, *next, *end;
+	size_t cmd_len = 0;
+	unsigned long byte_val;
+	uint8_t cmd[CMD_SIZE];
+	int ret;
+
+	if (!poe->hardcore_hacking_mode_en)
+		return UBUS_STATUS_PERMISSION_DENIED;
+
+	blobmsg_parse(ubus_poe_rawframe_policy,
+		      ARRAY_SIZE(ubus_poe_rawframe_policy),
+		      tb, blob_data(msg), blob_len(msg));
+	if (!*tb)
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	frame = blobmsg_get_string(*tb);
+	end = frame + strlen(frame);
+	next = frame;
+
+	while ((next < end) && (cmd_len < sizeof(cmd))) {
+		errno = 0;
+		byte_val = strtoul(frame, &next, 16);
+		if (errno || (frame == next) || (byte_val > 0xff))
+			return UBUS_STATUS_INVALID_ARGUMENT;
+
+		cmd[cmd_len++] = byte_val;
+		frame = next;
+	}
+
+	ret = mcu_queue_buf(mcu, cmd, cmd_len);
+	return (ret < 0) ? UBUS_STATUS_SYSTEM_ERROR : UBUS_STATUS_OK;
 }
 
 static int ubus_poe_reload_cb(struct ubus_context *ctx, struct ubus_object *obj,
@@ -1969,6 +2017,7 @@ static const struct ubus_method ubus_poe_methods[] = {
 	UBUS_METHOD_NOARG("leds", ubus_poe_leds_cb),
 	UBUS_METHOD_NOARG("reload", ubus_poe_reload_cb),
 	UBUS_METHOD("sendframe", ubus_poe_sendframe_cb, ubus_poe_sendframe_policy),
+	UBUS_METHOD("rawframe", ubus_poe_rawframe_cb, ubus_poe_rawframe_policy),
 	UBUS_METHOD("manage", ubus_poe_manage_cb, ubus_poe_manage_policy),
 	UBUS_METHOD("set_port_config", ubus_poe_set_port_config_cb,
 		    ubus_poe_set_port_config_policy),
