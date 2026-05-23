@@ -826,6 +826,84 @@ static int poe_reply_port_power_stats(struct mcu_state *state, uint8_t *reply)
 	return 0;
 }
 
+/* 0x42 - Get port LED config. Stock: board_poe_portLed_set (0x39e8).
+ * Reply layout from svanheule.net:
+ * [enable][interface][shift_order][led_count][off][req][err][on][blink_override]
+ * Adapted from grobian PR Hurricos/realtek-poe#48 */
+static int poe_cmd_port_led_config(struct mcu *mcu)
+{
+	uint8_t cmd[] = { LED_GET_PORT_CONFIG, 0x00 };
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
+static int poe_reply_port_led_config(struct mcu_state *state, uint8_t *reply)
+{
+	state->port_led_config.enable         = reply[2];
+	state->port_led_config.interface      = reply[3] & 0x1;
+	state->port_led_config.shift_order    = reply[4] & 0x1;
+	state->port_led_config.led_count      = reply[5] & 0x3;
+	state->port_led_config.state_off      = reply[6];
+	state->port_led_config.state_req      = reply[7];
+	state->port_led_config.state_err      = reply[8];
+	state->port_led_config.state_on       = reply[9];
+	state->port_led_config.blink_override = reply[10] & 0x3;
+
+	return 0;
+}
+
+/* 0x44 - Get system LED config. Stock: board_poe_led_set (0x3920).
+ * Reply: [sys_ok][in_gb][out_of_gb][exceeds_ps][off_delay1][off_delay2][map_enable] */
+static int poe_cmd_system_led_config(struct mcu *mcu)
+{
+	uint8_t cmd[] = { LED_GET_SYSTEM_CONFIG, 0x00 };
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
+static int poe_reply_system_led_config(struct mcu_state *state, uint8_t *reply)
+{
+	state->sys_led_config.sys_ok               = reply[2] & 0x1;
+	state->sys_led_config.in_gb                = reply[3] & 0x3;
+	state->sys_led_config.out_of_gb            = reply[4] & 0x3;
+	state->sys_led_config.exceeds_ps           = reply[5] & 0x3;
+	state->sys_led_config.out_of_gb_off_delay  = reply[6];
+	state->sys_led_config.exceeds_ps_off_delay = reply[7];
+	state->sys_led_config.map_enable           = reply[8];
+
+	if (state->sys_led_config.map_enable == 0xff)
+		state->sys_led_config.map_enable = 0;
+
+	return 0;
+}
+
+/* 0x49 - Get port LED map. Stock: board_poe_portLedCtrl_set (0x3cc4).
+ * Returns LED position mapping for 8 ports starting at reply[2].
+ * GS1900-8HP: lan1=0..lan8=7 sequential. */
+static int poe_cmd_port_led_map(struct mcu *mcu, uint8_t first_port)
+{
+	uint8_t cmd[] = { LED_GET_PORT_MAP, 0x00, first_port };
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
+static int poe_reply_port_led_map(struct mcu_state *state, uint8_t *reply)
+{
+	struct port_led_map *map = &state->led_maps[reply[2] / 8];
+
+	map->offset = reply[2];
+	map->ports[0] = reply[3];
+	map->ports[1] = reply[4];
+	map->ports[2] = reply[5];
+	map->ports[3] = reply[6];
+	map->ports[4] = reply[7];
+	map->ports[5] = reply[8];
+	map->ports[6] = reply[9];
+	map->ports[7] = reply[10];
+
+	return 0;
+}
+
 /* 0x22 - Get port counters. Stock bcm59111_portStats_get sends reset=1
  * to clear MCU single-byte counters after reading, preventing overflow. */
 static int poe_cmd_port_counters(struct mcu *mcu, uint8_t port)
@@ -935,6 +1013,9 @@ static poe_reply_handler reply_handler[] = {
 	[PORT_RESET]			= poe_reply_4_port,
 	[MCU_SET_DEVICE_POWER_MGMT]	= poe_reply_clear_counters,
 	[MCU_SET_HIGH_POWER_LIMIT]	= poe_reply_clear_counters,
+	[LED_GET_PORT_CONFIG]		= poe_reply_port_led_config,
+	[LED_GET_SYSTEM_CONFIG]	= poe_reply_system_led_config,
+	[LED_GET_PORT_MAP]		= poe_reply_port_led_map,
 };
 
 static void mcu_clear_timeout(struct uloop_timeout *t)
@@ -1391,6 +1472,15 @@ static void state_timeout_cb(struct uloop_timeout *t)
 		poe_cmd_port_power_stats(mcu, i);
 	}
 
+	/* LED config: query once per cycle (only in debug mode to avoid
+	 * unnecessary MCU traffic). Stock queries these at init only. */
+	if (poe->hardcore_hacking_mode_en) {
+		poe_cmd_port_led_config(mcu);
+		poe_cmd_system_led_config(mcu);
+		for (i = 0; i < cfg->port_count; i += 8)
+			poe_cmd_port_led_map(mcu, i);
+	}
+
 	uloop_timeout_set(t, 2 * 1000);
 }
 
@@ -1763,9 +1853,120 @@ static int ubus_poe_set_port_config_cb(struct ubus_context *ctx,
 	return UBUS_STATUS_NOT_FOUND;
 }
 
+/* ubus call poe leds — Read-only LED status retrieval.
+ * Pattern from grobian PR Hurricos/realtek-poe#48, adapted for our struct layout. */
+static const char *sys_led_mode[] = {
+	"off", "on", "blink slow", "blink fast", "on when PoE+", "on when PoE"
+};
+
+static const char *blink_override_mode[] = {
+	"none",
+	"blink when port status is 'requesting'",
+	"blink when port status is 'fault'",
+	"blink when port status is 'requesting' or 'fault'"
+};
+
+static void led_state_to_str(char *buf, size_t len, uint8_t state,
+			     uint8_t led_count, uint8_t check_mask,
+			     uint8_t true_val, uint8_t false_val)
+{
+	const char *on_str;
+
+	if (led_count == 1) {
+		on_str = GET_STR(state & 1 ? (state & check_mask ? true_val : 1) : false_val,
+				 sys_led_mode);
+		snprintf(buf, len, "led %s", on_str ? on_str : "unknown");
+	} else {
+		const char *l1, *l2;
+		l1 = GET_STR(state & 1 ? (state & check_mask ? true_val : 1) : false_val,
+			      sys_led_mode);
+		l2 = GET_STR(state & 2 ? (state & check_mask ? true_val : 1) : false_val,
+			      sys_led_mode);
+		snprintf(buf, len, "led 1 %s, led 2 %s",
+			 l1 ? l1 : "unknown", l2 ? l2 : "unknown");
+	}
+}
+
+static int ubus_poe_leds_cb(struct ubus_context *ctx, struct ubus_object *obj,
+			    struct ubus_request_data *req, const char *method,
+			    struct blob_attr *msg)
+{
+	struct poe_ctx *poe = ubus_to_poe_ctx(ctx);
+	const struct mcu_state *state = &poe->mcu.state;
+	const struct config *cfg = &poe->config;
+	struct blob_buf *b = &poe->blob_buf;
+	char tmp[64];
+	void *c;
+	size_t i;
+
+	blob_buf_init(b, 0);
+
+	c = blobmsg_open_table(b, "system");
+	blobmsg_add_u8(b, "sys_ok", state->sys_led_config.sys_ok);
+	blobmsg_add_u8(b, "in_gb", state->sys_led_config.in_gb);
+	blobmsg_add_u8(b, "out_of_gb", state->sys_led_config.out_of_gb);
+	blobmsg_add_u8(b, "exceeds_ps", state->sys_led_config.exceeds_ps);
+	blobmsg_add_u32(b, "out_of_gb_off_delay",
+			state->sys_led_config.out_of_gb_off_delay);
+	blobmsg_add_u32(b, "exceeds_ps_off_delay",
+			state->sys_led_config.exceeds_ps_off_delay);
+	blobmsg_add_u8(b, "map_enable", state->sys_led_config.map_enable);
+	blobmsg_close_table(b, c);
+
+	c = blobmsg_open_table(b, "map");
+	for (i = 0; i < cfg->port_count; i++) {
+		const struct port_led_map *map = &state->led_maps[i / 8];
+		if (i % 8 == 0)
+			blobmsg_add_u32(b, "offset", map->offset);
+		blobmsg_add_u32(b, cfg->ports[i].name, map->ports[i % 8]);
+	}
+	blobmsg_close_table(b, c);
+
+	c = blobmsg_open_table(b, "port");
+	blobmsg_add_u8(b, "enable", state->port_led_config.enable);
+	blobmsg_add_string(b, "interface",
+			   state->port_led_config.interface ? "GPIO" : "SPI");
+	blobmsg_add_string(b, "shift_order",
+			   state->port_led_config.shift_order ? "MSB" : "LSB");
+	blobmsg_add_u32(b, "port_led_count", state->port_led_config.led_count);
+
+	led_state_to_str(tmp, sizeof(tmp), state->port_led_config.state_off,
+			 state->port_led_config.led_count, 0, 0, 0);
+	blobmsg_add_string(b, "state_off", tmp);
+
+	led_state_to_str(tmp, sizeof(tmp), state->port_led_config.state_req,
+			 state->port_led_config.led_count, 0x80, 2, 0);
+	blobmsg_add_string(b, "state_req", tmp);
+
+	led_state_to_str(tmp, sizeof(tmp), state->port_led_config.state_err,
+			 state->port_led_config.led_count, 0x80, 3, 0);
+	blobmsg_add_string(b, "state_err", tmp);
+
+	if (state->port_led_config.state_on & 0x40 &&
+	    state->port_led_config.led_count == 2)
+		led_state_to_str(tmp, sizeof(tmp), state->port_led_config.state_on,
+				 state->port_led_config.led_count, 0x40, 4, 5);
+	else
+		led_state_to_str(tmp, sizeof(tmp), state->port_led_config.state_on,
+				 state->port_led_config.led_count, 0, 0, 0);
+	blobmsg_add_string(b, "state_on", tmp);
+
+	{
+		const char *bo = GET_STR(state->port_led_config.blink_override,
+					 blink_override_mode);
+		blobmsg_add_string(b, "blink_override", bo ? bo : "unknown");
+	}
+	blobmsg_close_table(b, c);
+
+	ubus_send_reply(ctx, req, b->head);
+
+	return UBUS_STATUS_OK;
+}
+
 static const struct ubus_method ubus_poe_methods[] = {
 	UBUS_METHOD_NOARG("info", ubus_poe_info_cb),
 	UBUS_METHOD_NOARG("debug", ubus_poe_debug_cb),
+	UBUS_METHOD_NOARG("leds", ubus_poe_leds_cb),
 	UBUS_METHOD_NOARG("reload", ubus_poe_reload_cb),
 	UBUS_METHOD("sendframe", ubus_poe_sendframe_cb, ubus_poe_sendframe_policy),
 	UBUS_METHOD("manage", ubus_poe_manage_cb, ubus_poe_manage_policy),

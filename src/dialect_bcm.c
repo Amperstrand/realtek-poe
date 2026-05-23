@@ -30,6 +30,12 @@ static const struct dialect_map_entry bcm_dialect_mapping[] = {
 	[MCU_GET_PSE_POWER]		= {0x29, 1},
 	[PORT_GET_COUNTERS]		= {0x22, 1},
 	[MCU_GET_POWER_MGMT]		= {0x27, 1},
+
+	/* LED read commands (0x41-0x49)
+	 * Protocol: svanheule.net; Stock: board_poe_portLed_set (0x39e8) */
+	[LED_GET_PORT_CONFIG]		= {0x42, 1},
+	[LED_GET_SYSTEM_CONFIG]	= {0x44, 1},
+	[LED_GET_PORT_MAP]		= {0x49, 1},
 };
 
 static const struct dialect_map bcm_dialect_map = {
