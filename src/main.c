@@ -1633,6 +1633,7 @@ static int ubus_poe_manage_cb(struct ubus_context *ctx, struct ubus_object *obj,
 	struct mcu *mcu = &poe->mcu;
 	const char *port_name, *action;
 	bool enable;
+	int ret;
 	size_t i;
 
 	blobmsg_parse(ubus_poe_manage_policy,
@@ -1648,14 +1649,17 @@ static int ubus_poe_manage_cb(struct ubus_context *ctx, struct ubus_object *obj,
 		enable = true;
 	else if (!strcmp(action, "disable"))
 		enable = false;
-	else if (!strcmp(action, "clear_counters"))
-		return poe_cmd_clear_counters(mcu);
-	else if (!strcmp(action, "reset")) {
+	else if (!strcmp(action, "clear_counters")) {
+		ret = poe_cmd_clear_counters(mcu);
+		return (ret < 0) ? UBUS_STATUS_SYSTEM_ERROR : UBUS_STATUS_OK;
+	} else if (!strcmp(action, "reset")) {
+		/* Allow reset on any port, including disabled (upstream #58) */
 		for (i = 0; i < cfg->port_count; i++) {
 			port = &cfg->ports[i];
-			if (!port->enable || strcmp(port_name, port->name))
+			if (strcmp(port_name, port->name))
 				continue;
-			return poe_cmd_port_reset(mcu, i);
+			ret = poe_cmd_port_reset(mcu, i);
+			return (ret < 0) ? UBUS_STATUS_SYSTEM_ERROR : UBUS_STATUS_OK;
 		}
 		return UBUS_STATUS_NOT_FOUND;
 	} else
@@ -1665,7 +1669,8 @@ static int ubus_poe_manage_cb(struct ubus_context *ctx, struct ubus_object *obj,
 		port = &cfg->ports[i];
 		if (!port->enable || strcmp(port_name, port->name))
 			continue;
-		return poe_cmd_port_enable(mcu, i, enable);
+		ret = poe_cmd_port_enable(mcu, i, enable);
+		return (ret < 0) ? UBUS_STATUS_SYSTEM_ERROR : UBUS_STATUS_OK;
 	}
 	return UBUS_STATUS_OK;
 }
