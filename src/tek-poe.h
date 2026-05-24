@@ -214,6 +214,7 @@ struct config {
 	float threshold_low;
 
 	unsigned int forced_baudrate;
+	unsigned int poll_interval_ms;
 	unsigned int port_count;
 	uint8_t pse_id_set_budget_mask;
 	struct port_config ports[MAX_PORT];

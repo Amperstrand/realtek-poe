@@ -147,6 +147,7 @@ static void load_global_config(struct config *cfg, struct uci_context *uci,
 {
 	const char *budget, *guardband, *baudrate_hack, *dialect_hack;
 	const char *threshold_high, *threshold_low;
+	const char *poll_interval_str;
 
 	budget = uci_lookup_option_string(uci, s, "budget");
 	guardband = uci_lookup_option_string(uci, s, "guard");
@@ -154,6 +155,7 @@ static void load_global_config(struct config *cfg, struct uci_context *uci,
 	dialect_hack = uci_lookup_option_string(uci, s, "force_dialect");
 	threshold_high = uci_lookup_option_string(uci, s, "power_threshold_high");
 	threshold_low = uci_lookup_option_string(uci, s, "power_threshold_low");
+	poll_interval_str = uci_lookup_option_string(uci, s, "poll_interval");
 
 	cfg->budget = budget ? strtof(budget, NULL) : 31.0;
 	cfg->budget_guard = cfg->budget / 10;
@@ -164,6 +166,13 @@ static void load_global_config(struct config *cfg, struct uci_context *uci,
 	cfg->threshold_low = threshold_low ? strtof(threshold_low, NULL) : 0.0;
 	if (cfg->threshold_high > 0.0 && cfg->threshold_low <= 0.0)
 		cfg->threshold_low = cfg->threshold_high - 10.0;
+
+	cfg->poll_interval_ms = poll_interval_str
+		? strtoul(poll_interval_str, NULL, 10) : 2000;
+	if (cfg->poll_interval_ms < 500)
+		cfg->poll_interval_ms = 500;
+	if (cfg->poll_interval_ms > 30000)
+		cfg->poll_interval_ms = 30000;
 
 	if (baudrate_hack) {
 		warn_unsupported_config("force_baudrate");
@@ -1484,7 +1493,7 @@ static void state_timeout_cb(struct uloop_timeout *t)
 		poe_cmd_port_power_stats(mcu, i);
 	}
 
-	uloop_timeout_set(t, 2 * 1000);
+	uloop_timeout_set(t, cfg->poll_interval_ms);
 }
 
 static int ubus_poe_info_cb(struct ubus_context *ctx, struct ubus_object *obj,
