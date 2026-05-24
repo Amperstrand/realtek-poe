@@ -86,3 +86,28 @@ We have access to the following test hardware:
 ## Known Issues Under Investigation
 
 See `research/` directory for detailed findings.
+
+### Upstream Issue #32 — 802.3bt and Paired Port Support
+
+**Status**: Blocked — no BCM59121 hardware to test on.
+
+**Problem**: 802.3bt (4-pair) devices don't power up on BCM59121-based switches (e.g., Netgear GS110TUP). Standard 802.3af/at (2-pair) works fine. The issue requires mapping two PSE controller outputs to a single port for 4-pair delivery.
+
+**What we verified on our BCM59111 (2-pair only hardware)**:
+- Command 0x19 (Set port power pair) works — MCU accepts A-pair (00) and B-pair (01) with error=0, value persists on read-back via 0x25 GET CONFIG reply[8]
+- Our device: `port_map_en=0`, `system_status` bit 3=0 (pair mapping not enabled), single PSE controller — no pairing possible
+- Full UART test log in conwrt `docs/POE_PARITY.md` under "CPU Utilization Investigation"
+
+**Solution path for BCM59121 hardware** (protocol from svanheule.net):
+
+| Step | Command | What | Status |
+|------|---------|------|--------|
+| Read current mapping | 0x26 GET EXT CONFIG | Returns `primary_pse_output` and `secondary_pse_output` per port | ✅ Already decoded in our code |
+| Read pair mapping status | 0x20 GET SYSTEM INFO | `system_status` bit 3 = "Output pairing enabled" | ✅ Already decoded |
+| Set power-up mode to bt | 0x1c SET PORT POE MODE | mode=05 (802.3bt) | ✅ Already in dialect (`PORT_SET_POE_MODE`) |
+| A/B pair selection | 0x19 SET PORT POWER PAIR | pair=00 (A) or 01 (B) | ✅ Verified working, needs dialect entry |
+| Map port → PSE output | 0x1d SET PORT MAPPING | `[port] [pse_output]` where pse_output = 8×APSE + N | ❌ Not in dialect, protocol fully documented |
+| Full PSE output mapping | 0x0e SET PORT TO PSE OUTPUT | 7 parameters (b1-b7), values documented | ❌ Not in dialect, some params "likely" not confirmed |
+| Enable pair mapping | Unknown | Which command sets system_status bit 3 | ❌ Unknown — likely achieved by 0x0e sequence |
+
+**To pick this up**: Get UART capture from stock firmware on a BCM59121 device during init. The init sequence will show the exact 0x0e/0x1d commands and parameter values. Then implement in `dialect_bcm.c` and test on hardware.
