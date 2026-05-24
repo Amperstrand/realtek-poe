@@ -1507,6 +1507,14 @@ static int ubus_poe_info_cb(struct ubus_context *ctx, struct ubus_object *obj,
 	char tmp[16];
 	size_t i;
 	void *c;
+	int any_port_status = 0;
+
+	for (i = 0; i < cfg->port_count; i++) {
+		if (cfg->ports[i].valid && state->ports[i].status) {
+			any_port_status = 1;
+			break;
+		}
+	}
 
 	blob_buf_init(b, 0);
 
@@ -1534,6 +1542,8 @@ static int ubus_poe_info_cb(struct ubus_context *ctx, struct ubus_object *obj,
 			blobmsg_add_string(b, "mode", state->ports[i].poe_mode);
 		if (state->ports[i].status)
 			blobmsg_add_string(b, "status", state->ports[i].status);
+		else if (!any_port_status)
+			blobmsg_add_string(b, "status", "initializing");
 		else
 			blobmsg_add_string(b, "status", "unknown");
 		if (state->ports[i].watt)
