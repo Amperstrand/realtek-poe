@@ -1073,6 +1073,9 @@ static poe_reply_handler reply_handler[] = {
 	[LED_GET_PORT_CONFIG]		= poe_reply_port_led_config,
 	[LED_GET_SYSTEM_CONFIG]	= poe_reply_system_led_config,
 	[LED_GET_PORT_MAP]		= poe_reply_port_led_map,
+	[LED_SET_PORT_CONFIG]		= poe_reply_clear_counters,
+	[LED_SET_SYSTEM_CONFIG]	= poe_reply_clear_counters,
+	[LED_SET_PORT_MAP]		= poe_reply_clear_counters,
 };
 
 static void mcu_clear_timeout(struct uloop_timeout *t)
