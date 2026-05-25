@@ -1,38 +1,38 @@
 #
-# This is a hacky workflow to build the realtek-poe package
+# Build realtek-poe .ipk using the OpenWrt SDK Docker image.
 #
-# The magic is in the Docker image containing the openwrt SDK. The trick is
-# to drop realtek-poe inside the packages/ subdir of the SDK. This is achieved
-# by mounting a docker volume as the realtek-poe package.
-# Similarly a volume is mounted for the artifacts directory "bin/". The latter
-# volume is used to extract the .ipk from the container and upload it.
+# The SDK Docker image contains the cross-compiler toolchain and staged
+# libraries. We mount this repo as a package directory inside the SDK tree
+# and compile it into a ready-to-install .ipk artifact.
 #
-# The entire workings are very hacky. Don't let perfect be the enemy of good!
+# Artifacts are tagged with branch name and commit SHA for easy identification.
 #
 
-name: CI
+name: Build .ipk
 
 on:
   push:
-    branches: [ "master", "realtek-poe", "ai/power-limit-config" ]
+    branches: [ "ai-experiments", "ai/**" ]
   pull_request:
-    branches: [ "master", "realtek-poe" ]
+    branches: [ "ai-experiments" ]
+  workflow_dispatch:  # Allow manual trigger from any branch
 
 jobs:
   build:
-    name: Build
+    name: Build realtek-poe .ipk
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Copy-paste from openwrt action
+      - name: Prepare build directory
         run: |
           mkdir $GITHUB_WORKSPACE/bin
           sudo chown -R 1000:1000 $GITHUB_WORKSPACE
 
-      - name: Build in docker container
+      - name: Build in OpenWrt SDK container
         run: |
           docker run --rm \
             -v $GITHUB_WORKSPACE/bin:/home/build/openwrt/bin \
@@ -42,11 +42,37 @@ jobs:
               ./scripts/feeds update base \
               && ./scripts/feeds install libubus libuci \
               && make defconfig \
-              && make package/realtek-poe/compile -j$(nproc) V=s
+              && make package/realtek-poe/compile -j\$(nproc) V=s
             "
 
-      - name: Store packages
+      - name: Rename artifact with branch and commit
+        run: |
+          BRANCH_NAME="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          # Sanitize branch name for artifact naming (replace / with -)
+          SAFE_BRANCH="${BRANCH_NAME//\//-}"
+          SHORT_SHA="${GITHUB_SHA:0:8}"
+          ARTIFACT_NAME="realtek-poe_${SAFE_BRANCH}_${SHORT_SHA}"
+
+          # Find and rename the .ipk
+          SRCDIR="bin/packages/mips_4kec/base"
+          if [ -d "$SRCDIR" ]; then
+            mkdir -p dist
+            for f in "$SRCDIR"/realtek-poe_*.ipk; do
+              BASENAME=$(basename "$f")
+              # Insert branch+sha before .ipk extension
+              NEWNAME="${BASENAME%.ipk}_${SAFE_BRANCH}_${SHORT_SHA}.ipk"
+              cp "$f" "dist/$NEWNAME"
+              echo "Built: dist/$NEWNAME"
+            done
+          else
+            echo "ERROR: No .ipk found in $SRCDIR"
+            find bin -name "*.ipk" 2>/dev/null
+            exit 1
+          fi
+
+      - name: Upload .ipk artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mips_4kec-packages
-          path: bin/packages/mips_4kec/base/realtek-poe_*.ipk
+          name: realtek-poe-${{ github.ref_name }}-${{ github.sha }}
+          path: dist/*.ipk
+          retention-days: 30
