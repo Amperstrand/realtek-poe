@@ -50,11 +50,13 @@ jobs:
         run: sudo chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE
 
       - name: Rename artifact with branch and commit
+        id: rename
         run: |
           BRANCH_NAME="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
           # Sanitize branch name for artifact naming (replace / with -)
           SAFE_BRANCH="${BRANCH_NAME//\//-}"
           SHORT_SHA="${GITHUB_SHA:0:8}"
+          echo "safe_branch=$SAFE_BRANCH" >> "$GITHUB_OUTPUT"
 
           echo "=== Searching for built packages ==="
           find bin -type f \( -name "*.ipk" -o -name "*.apk" \) 2>/dev/null
@@ -82,6 +84,6 @@ jobs:
       - name: Upload package artifact
         uses: actions/upload-artifact@v4
         with:
-          name: realtek-poe-${{ github.ref_name }}-${{ github.sha }}
+          name: realtek-poe-${{ steps.rename.outputs.safe_branch }}-${{ github.sha }}
           path: dist/*
           retention-days: 30
