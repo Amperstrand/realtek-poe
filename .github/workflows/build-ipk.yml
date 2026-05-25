@@ -61,7 +61,7 @@ jobs:
 
           # Find all package files and copy to dist with branch+sha tag
           FOUND=0
-          for f in $(find bin -type f \( -name "realtek-poe_*.ipk" -o -name "realtek-poe_*.apk" \) 2>/dev/null); do
+          for f in $(find bin -type f \( -name "realtek-poe*.ipk" -o -name "realtek-poe*.apk" \) 2>/dev/null); do
             BASENAME=$(basename "$f")
             EXT="${BASENAME##*.}"
             STEM="${BASENAME%.*}"
