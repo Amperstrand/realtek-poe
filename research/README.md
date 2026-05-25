@@ -4,16 +4,16 @@
 
 | File | Topic | Status |
 |---|---|---|
-| `gs1900-8hp-poe-analysis.md` | Full PoE protocol analysis, hardware specs, decoded commands, bug list | Complete (no-load) |
+| `gs1900-8hp-poe-analysis.md` | Full PoE protocol analysis, hardware specs, decoded commands, bug list | Updated with load test data |
 | `notes/` | Daily research logs | Ongoing |
 
 ## Planned Research
 
-- [ ] Stock firmware MCU communication reverse engineering
-- [ ] PoE load testing results (requires hardware)
+- [x] Stock firmware MCU communication reverse engineering (web UI cmd mapping done, UART protocol same as OpenWrt)
+- [x] PoE load testing results (NR7101 ~5W load, stock vs OpenWrt comparison, disable/enable tested)
 - [ ] Broadcom vs Realtek dialect feature matrix
 - [ ] Power management mode investigation
-- [ ] Per-port power measurement accuracy study
+- [x] Per-port power measurement accuracy study (stock mW vs OpenWrt W, within ~0.5W tolerance)
 
 ## Upstream Issues We're Investigating
 
@@ -32,3 +32,4 @@ We do NOT comment on these issues. All findings stay in this fork until a human 
 | GS1900-8HP A1 #1 | 192.168.1.2 | OpenWrt (Linux 6.12.74, RTL8380) | SSH (root, no password) | Primary test device |
 | GS1900-8HP A1 #2 | 192.168.1.1 | ZyXEL stock V2.90 | HTTP (admin/Zyxel2026!) | Stock comparison device |
 | MacBook (en5 USB) | 192.168.1.100 | macOS | Local | Control workstation |
+| NR7101 | 192.168.1.10 | OpenWrt (mips) | SSH (root, no password) | PoE test load (~5W, connected to port 8 on both switches) |

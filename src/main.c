@@ -52,6 +52,17 @@ struct poe_ctx {
 	struct blob_buf blob_buf;
 	struct uloop_timeout state_timeout;
 	unsigned int hardcore_hacking_mode_en : 1;
+	unsigned int threshold_over_active : 1;
+
+	/* Snapshot of last reported per-port status for edge-triggered events. */
+	const char *last_port_status[MAX_PORT];
+	uint8_t last_port_class[MAX_PORT];
+	uint16_t last_cnt_overload[MAX_PORT];
+	uint16_t last_cnt_short[MAX_PORT];
+	uint16_t last_cnt_denied[MAX_PORT];
+	uint16_t last_cnt_mps_absent[MAX_PORT];
+	uint16_t last_cnt_invalid_signature[MAX_PORT];
+	unsigned int port_status_initialized : 1;
 };
 
 static struct poe_ctx *ubus_to_poe_ctx(struct ubus_context *u)
@@ -63,7 +74,8 @@ static struct poe_ctx *ubus_to_poe_ctx(struct ubus_context *u)
 static void load_port_config(struct config *cfg, struct uci_context *uci,
 			     struct uci_section *s)
 {
-	const char * name, *id_str, *enable, *priority, *poe_plus;
+	const char *name, *id_str, *enable, *priority, *poe_plus;
+	const char *power_limit_type_str, *power_limit_str, *poe_type;
 	unsigned long id;
 
 	id_str = uci_lookup_option_string(uci, s, "id");
@@ -71,6 +83,9 @@ static void load_port_config(struct config *cfg, struct uci_context *uci,
 	enable = uci_lookup_option_string(uci, s, "enable");
 	priority = uci_lookup_option_string(uci, s, "priority");
 	poe_plus = uci_lookup_option_string(uci, s, "poe_plus");
+	poe_type = uci_lookup_option_string(uci, s, "poe_type");
+	power_limit_type_str = uci_lookup_option_string(uci, s, "power_limit_type");
+	power_limit_str = uci_lookup_option_string(uci, s, "power_limit");
 
 	if (!id_str || !name) {
 		ULOG_ERR("invalid port with missing name and id");
@@ -92,8 +107,30 @@ static void load_port_config(struct config *cfg, struct uci_context *uci,
 	if (cfg->ports[id].priority > 3)
 		cfg->ports[id].priority = 3;
 
-	if (poe_plus && !strcmp(poe_plus, "1"))
+	cfg->ports[id].power_limit_type = power_limit_type_str ?
+		strtoul(power_limit_type_str, NULL, 0) : 1;
+	if (cfg->ports[id].power_limit_type > 2)
+		cfg->ports[id].power_limit_type = 1;
+
+	cfg->ports[id].power_limit_mw = power_limit_str ?
+		strtoul(power_limit_str, NULL, 0) : 0;
+	if (cfg->ports[id].power_limit_mw > 33000)
+		cfg->ports[id].power_limit_mw = 33000;
+
+	if (poe_type) {
+		if (!strcmp(poe_type, "802.3af"))
+			cfg->ports[id].power_up_mode = 1;
+		else if (!strcmp(poe_type, "802.3at"))
+			cfg->ports[id].power_up_mode = 3;
+		else if (!strcmp(poe_type, "legacy"))
+			cfg->ports[id].power_up_mode = 0;
+		else if (!strcmp(poe_type, "pre-802.3at"))
+			cfg->ports[id].power_up_mode = 2;
+		else
+			cfg->ports[id].power_up_mode = strtoul(poe_type, NULL, 0);
+	} else if (poe_plus && !strcmp(poe_plus, "1")) {
 		cfg->ports[id].power_up_mode = 3;
+	}
 }
 
 static void warn_unsupported_config(const char *cfg_name)
@@ -109,16 +146,33 @@ static void load_global_config(struct config *cfg, struct uci_context *uci,
 
 {
 	const char *budget, *guardband, *baudrate_hack, *dialect_hack;
+	const char *threshold_high, *threshold_low;
+	const char *poll_interval_str;
 
 	budget = uci_lookup_option_string(uci, s, "budget");
 	guardband = uci_lookup_option_string(uci, s, "guard");
 	baudrate_hack = uci_lookup_option_string(uci, s, "force_baudrate");
 	dialect_hack = uci_lookup_option_string(uci, s, "force_dialect");
+	threshold_high = uci_lookup_option_string(uci, s, "power_threshold_high");
+	threshold_low = uci_lookup_option_string(uci, s, "power_threshold_low");
+	poll_interval_str = uci_lookup_option_string(uci, s, "poll_interval");
 
 	cfg->budget = budget ? strtof(budget, NULL) : 31.0;
 	cfg->budget_guard = cfg->budget / 10;
 	if (guardband)
 		cfg->budget_guard = strtof(guardband, NULL);
+
+	cfg->threshold_high = threshold_high ? strtof(threshold_high, NULL) : 0.0;
+	cfg->threshold_low = threshold_low ? strtof(threshold_low, NULL) : 0.0;
+	if (cfg->threshold_high > 0.0 && cfg->threshold_low <= 0.0)
+		cfg->threshold_low = cfg->threshold_high - 10.0;
+
+	cfg->poll_interval_ms = poll_interval_str
+		? strtoul(poll_interval_str, NULL, 10) : 2000;
+	if (cfg->poll_interval_ms < 500)
+		cfg->poll_interval_ms = 500;
+	if (cfg->poll_interval_ms > 30000)
+		cfg->poll_interval_ms = 30000;
 
 	if (baudrate_hack) {
 		warn_unsupported_config("force_baudrate");
@@ -308,6 +362,15 @@ static int poet_cmd_4_port(struct mcu *mcu, uint8_t cmd_id, uint8_t port[4],
 static int poe_cmd_port_enable(struct mcu *mcu, uint8_t port, uint8_t enable)
 {
 	uint8_t cmd[] = { PORT_ENABLE, 0x00, port, enable };
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
+/* 0x03 - Port reset (restart PSE output and re-detect PD).
+ * Stock: bcm59111_cmd_set enum 3 = 0x03, used to clear fault states. */
+static int poe_cmd_port_reset(struct mcu *mcu, uint8_t port)
+{
+	uint8_t cmd[] = { PORT_RESET, 0x00, port, 0x01 };
 
 	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
 }
@@ -510,9 +573,16 @@ static int poe_reply_port_status(struct mcu_state *state, uint8_t *reply)
 		return -EPROTO;
 	}
 
+	/* Stock: poe_bcm59111_portStatus_get extracts all 9 fields from the
+	 * 0x21 reply: [port] [state] [fault_type] [class_info] [pd_type]
+	 * [mpss_mask] [power_mode] [chan_pwr] [pd_alt] */
+	port->fault_type = reply[4];
 	port->class_info = reply[5];
 	port->pd_type = reply[6];
 	port->mpss_mask = reply[7];
+	port->power_mode = reply[8];
+	port->chan_pwr = reply[9];
+	port->pd_alt = reply[10];
 	port->has_detailed_state = 1;
 
 	return 0;
@@ -530,6 +600,65 @@ static int poe_reply_power_stats(struct mcu_state *state, uint8_t *reply)
 {
 	state->power_consumption = read16_be(reply + 2) * 0.1;
 	state->reported_power_budget = read16_be(reply + 4) * 0.1;
+	state->pse_id = reply[6];
+	state->high_power = reply[7];
+	state->gb_hysteresis = reply[10];
+
+	return 0;
+}
+
+/* 0x29 - Get all PSE output consumed power
+ *	Request format: { [pse_output] 01 } pairs, up to 4 pairs per frame
+ *	Response format: { [pse_output] [consumed_power] } pairs
+ *	consumed_power is in units of 0.2W
+ */
+static int poe_cmd_pse_power(struct mcu *mcu, uint8_t p1, uint8_t p2,
+			     uint8_t p3, uint8_t p4)
+{
+	uint8_t cmd[] = { MCU_GET_PSE_POWER, 0x00,
+			  p1, 1, p2, 1, p3, 1, p4, 1 };
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
+static int poe_reply_pse_power(struct mcu_state *state, uint8_t *reply)
+{
+	float total = 0;
+	int i;
+
+	for (i = 2; i < OFFSET_CHECKSUM; i += 2) {
+		uint8_t pse_output = reply[i];
+		uint8_t consumed = reply[i + 1];
+
+		if (pse_output == 0xff)
+			continue;
+
+		total += consumed * 0.2;
+	}
+
+	state->allocated_power += total;
+
+	return 0;
+}
+
+/* 0x27 - Get power management mode
+ *	Reply: [mode] [power_limit_0 2B] [guard_band_0 2B] [power_limit_1 2B] [guard_band_1 2B]
+ *	Units of 0.1W for power_limit/guard_band. Request specifies PSE index.
+ */
+static int poe_cmd_power_mgmt(struct mcu *mcu, uint8_t pse)
+{
+	uint8_t cmd[] = { MCU_GET_POWER_MGMT, 0x00, pse };
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
+static int poe_reply_power_mgmt(struct mcu_state *state, uint8_t *reply)
+{
+	state->pm_mode = reply[2];
+	state->pm_power_limit[0] = read16_be(reply + 3) * 0.1;
+	state->pm_guard_band[0] = read16_be(reply + 5) * 0.1;
+	state->pm_power_limit[1] = read16_be(reply + 7) * 0.1;
+	state->pm_guard_band[1] = read16_be(reply + 9) * 0.1;
 
 	return 0;
 }
@@ -598,6 +727,7 @@ static int poe_reply_port_ext_config(struct mcu_state *state, uint8_t *reply)
 	/* In the realtek dialect, mapping comes from a different byte. */
 	if (reply[8] != 0xff)
 		port->mapping = reply[8];
+	port->primary_power_limit = reply[9];
 
 	return 0;
 }
@@ -626,6 +756,8 @@ const char *port_short_status_to_str(uint8_t short_status)
 	return GET_STR(short_status & 0xf, status);
 }
 
+static int port_status_is_fault(const char *status);
+
 static int poe_reply_4_port_status(struct mcu_state *state, uint8_t *reply)
 {
 	int i, port, pstate;
@@ -642,6 +774,16 @@ static int poe_reply_4_port_status(struct mcu_state *state, uint8_t *reply)
 		}
 
 		state->ports[port].status = port_short_status_to_str(pstate);
+
+		/* Stock: poe_bcm59111_allPortStatus_get extracts packed bits.
+		 * [7] = IEEE PD flag, [6:4] = class (delivering) or fault_type,
+		 * [3:0] = port state (already decoded above). */
+		state->ports[port].pd_type = (pstate & 0x80) ? 1 : 0;
+		if (port_status_is_fault(state->ports[port].status)) {
+			state->ports[port].fault_type = (pstate >> 4) & 0x7;
+		} else {
+			state->ports[port].class_info = (pstate >> 4) & 0x7;
+		}
 	}
 
 	return 0;
@@ -686,8 +828,157 @@ static int poe_reply_port_power_stats(struct mcu_state *state, uint8_t *reply)
 		return -EPROTO;
 	}
 
+	state->ports[port_idx].voltage = read16_be(reply + 3) * 64.45;
+	state->ports[port_idx].current = read16_be(reply + 5);
+	state->ports[port_idx].temperature = (220 - read16_be(reply + 7)) * 1.25;
 	state->ports[port_idx].watt = read16_be(reply + 9) * 0.1;
 	return 0;
+}
+
+/* 0x42 - Get port LED config. Stock: board_poe_portLed_set (0x39e8).
+ * Reply layout from svanheule.net:
+ * [enable][interface][shift_order][led_count][off][req][err][on][blink_override]
+ * Adapted from grobian PR Hurricos/realtek-poe#48 */
+static int poe_cmd_port_led_config(struct mcu *mcu)
+{
+	uint8_t cmd[] = { LED_GET_PORT_CONFIG, 0x00 };
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
+static int poe_reply_port_led_config(struct mcu_state *state, uint8_t *reply)
+{
+	state->port_led_config.enable         = reply[2];
+	state->port_led_config.interface      = reply[3] & 0x1;
+	state->port_led_config.shift_order    = reply[4] & 0x1;
+	state->port_led_config.led_count      = reply[5] & 0x3;
+	state->port_led_config.state_off      = reply[6];
+	state->port_led_config.state_req      = reply[7];
+	state->port_led_config.state_err      = reply[8];
+	state->port_led_config.state_on       = reply[9];
+	state->port_led_config.blink_override = reply[10] & 0x3;
+
+	return 0;
+}
+
+/* 0x44 - Get system LED config. Stock: board_poe_led_set (0x3920).
+ * Reply: [sys_ok][in_gb][out_of_gb][exceeds_ps][off_delay1][off_delay2][map_enable] */
+static int poe_cmd_system_led_config(struct mcu *mcu)
+{
+	uint8_t cmd[] = { LED_GET_SYSTEM_CONFIG, 0x00 };
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
+static int poe_reply_system_led_config(struct mcu_state *state, uint8_t *reply)
+{
+	state->sys_led_config.sys_ok               = reply[2] & 0x1;
+	state->sys_led_config.in_gb                = reply[3] & 0x3;
+	state->sys_led_config.out_of_gb            = reply[4] & 0x3;
+	state->sys_led_config.exceeds_ps           = reply[5] & 0x3;
+	state->sys_led_config.out_of_gb_off_delay  = reply[6];
+	state->sys_led_config.exceeds_ps_off_delay = reply[7];
+	state->sys_led_config.map_enable           = reply[8];
+
+	if (state->sys_led_config.map_enable == 0xff)
+		state->sys_led_config.map_enable = 0;
+
+	return 0;
+}
+
+/* 0x49 - Get port LED map. Stock: board_poe_portLedCtrl_set (0x3cc4).
+ * Returns LED position mapping for 8 ports starting at reply[2].
+ * GS1900-8HP: lan1=0..lan8=7 sequential. */
+static int poe_cmd_port_led_map(struct mcu *mcu, uint8_t first_port)
+{
+	uint8_t cmd[] = { LED_GET_PORT_MAP, 0x00, first_port };
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
+static int poe_reply_port_led_map(struct mcu_state *state, uint8_t *reply)
+{
+	struct port_led_map *map = &state->led_maps[reply[2] / 8];
+
+	map->offset = reply[2];
+	map->ports[0] = reply[3];
+	map->ports[1] = reply[4];
+	map->ports[2] = reply[5];
+	map->ports[3] = reply[6];
+	map->ports[4] = reply[7];
+	map->ports[5] = reply[8];
+	map->ports[6] = reply[9];
+	map->ports[7] = reply[10];
+
+	return 0;
+}
+
+/* 0x22 - Get port counters. Stock bcm59111_portStats_get sends reset=1
+ * to clear MCU single-byte counters after reading, preventing overflow. */
+static int poe_cmd_port_counters(struct mcu *mcu, uint8_t port)
+{
+	uint8_t cmd[] = { PORT_GET_COUNTERS, 0x00, port, 0x01 };
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
+static int poe_reply_port_counters(struct mcu_state *state, uint8_t *reply)
+{
+	unsigned int port_idx = reply[2];
+
+	if (port_idx > state->num_detected_ports) {
+		ULOG_WARN("Invalid port in counters reply (port=%d)\n", port_idx);
+		return -EPROTO;
+	}
+
+	state->ports[port_idx].cnt_overload = reply[3];
+	state->ports[port_idx].cnt_short = reply[4];
+	state->ports[port_idx].cnt_denied = reply[5];
+	state->ports[port_idx].cnt_mps_absent = reply[6];
+	state->ports[port_idx].cnt_invalid_signature = reply[7];
+
+	return 0;
+}
+
+/* 0x05 - Clear counters */
+static int poe_cmd_clear_counters(struct mcu *mcu)
+{
+	uint8_t cmd[] = { MCU_CLEAR_COUNTERS, 0x00, 0x01 };
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
+static int poe_reply_clear_counters(struct mcu_state *state, uint8_t *reply)
+{
+	if (reply[2])
+		ULOG_WARN("Counter clear failed: %u\n", reply[2]);
+
+	return 0;
+}
+
+/* 0x0b - Set device power management.
+ * Stock: poe_bcm59111_chip_init sends pre_alloc/powerup_mode/disconnect_order
+ * with gb_hysteresis to configure budget accounting mode. */
+static int poe_cmd_device_power_mgmt(struct mcu *mcu, uint8_t pre_alloc,
+				      uint8_t powerup_mode,
+				      uint8_t disconnect_order,
+				      uint8_t gb_hysteresis)
+{
+	uint8_t cmd[] = { MCU_SET_DEVICE_POWER_MGMT, 0x00,
+			  pre_alloc, powerup_mode, disconnect_order,
+			  0xff, 0xff, 0xff, 0xff, 0xff, gb_hysteresis };
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
+/* 0x07 - Set global port power limit (max per-port budget for class-based).
+ * Stock: bcm59111_cmd_set enum 7 = 0x07.
+ * high_power: 0=22.5W, 1=26.5W, 2=31.2W, 3=37.0W */
+static int poe_cmd_high_power_limit(struct mcu *mcu, uint8_t high_power)
+{
+	uint8_t cmd[] = { MCU_SET_HIGH_POWER_LIMIT, 0x00, high_power };
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
 }
 
 static int poe_reply_4_port(struct mcu_state *mcu, uint8_t *reply)
@@ -718,12 +1009,22 @@ static poe_reply_handler reply_handler[] = {
 	[PORT_SET_PRIORITY]             = poe_reply_4_port,
 	[MCU_GET_SYSTEM_INFO]		= poe_reply_status,
 	[MCU_GET_POWER_STATS]		= poe_reply_power_stats,
+	[MCU_GET_PSE_POWER]		= poe_reply_pse_power,
 	[PORT_GET_STATUS]		= poe_reply_port_status,
 	[PORT_GET_SHORT_STATUS]		= poe_reply_4_port_status,
 	[PORT_GET_POWER_STATS]		= poe_reply_port_power_stats,
+	[PORT_GET_COUNTERS]		= poe_reply_port_counters,
 	[PORT_GET_CONFIG]		= poe_reply_port_config,
 	[PORT_GET_EXT_CONFIG]		= poe_reply_port_ext_config,
 	[MCU_GET_EXT_CONFIG]		= poe_reply_extended_config,
+	[MCU_GET_POWER_MGMT]		= poe_reply_power_mgmt,
+	[MCU_CLEAR_COUNTERS]		= poe_reply_clear_counters,
+	[PORT_RESET]			= poe_reply_4_port,
+	[MCU_SET_DEVICE_POWER_MGMT]	= poe_reply_clear_counters,
+	[MCU_SET_HIGH_POWER_LIMIT]	= poe_reply_clear_counters,
+	[LED_GET_PORT_CONFIG]		= poe_reply_port_led_config,
+	[LED_GET_SYSTEM_CONFIG]	= poe_reply_system_led_config,
+	[LED_GET_PORT_MAP]		= poe_reply_port_led_map,
 };
 
 static void mcu_clear_timeout(struct uloop_timeout *t)
@@ -900,7 +1201,8 @@ static int poet_setup(struct mcu* mcu, const struct port_config *ports,
 			port_ids[num_okay] = i;
 			priorities[num_okay] = ports[i].priority;
 			powerup_mode[num_okay] = ports[i].power_up_mode;
-			limit_type[num_okay] = (ports[i].power_budget) ? 2 : 1;
+			limit_type[num_okay] = ports[i].power_limit_mw ?
+			2 : ports[i].power_limit_type;
 
 			if (++num_okay == 4)
 				break;
@@ -933,10 +1235,23 @@ static int poe_port_setup(struct mcu* mcu, const struct config *cfg)
 	poe_cmd_port_detection_type(mcu, PORT_ID_ALL, 3);
 
 	for (i = 0; i < cfg->port_count; i++) {
-		if (!cfg->ports[i].enable || !cfg->ports[i].power_budget)
+		uint8_t budget;
+
+		if (!cfg->ports[i].enable)
 			continue;
 
-		poe_cmd_port_power_budget(mcu, i, cfg->ports[i].power_budget);
+		if (cfg->ports[i].power_limit_mw) {
+			budget = cfg->ports[i].power_limit_mw / 200;
+			if (!budget)
+				budget = 1;
+			poe_cmd_port_power_budget(mcu, i, budget);
+		} else if (cfg->ports[i].power_budget) {
+			poe_cmd_port_power_budget(mcu, i, cfg->ports[i].power_budget);
+		} else {
+			/* Ensure MCU starts with class-default budget (15.4W)
+			 * rather than retaining stale values */
+			poe_cmd_port_power_budget(mcu, i, 77);
+		}
 	}
 
 	poet_setup(mcu, cfg->ports, cfg->port_count);
@@ -964,14 +1279,172 @@ static void poe_set_power_budget(struct mcu* mcu, const struct config *config)
 
 static int poe_initial_setup(struct mcu* mcu, const struct config *cfg)
 {
+	size_t i;
+
 	poe_cmd_status(mcu);
 	poe_cmd_power_mgmt_mode(mcu, 2);
 	poe_cmd_port_mapping_enable(mcu, false);
 	poe_set_power_budget(mcu, cfg);
 
+	/* Stock: poe_bcm59111_chip_init sends 0x0b with pre_alloc=1
+	 * (actual usage), powerup_mode=0 (simultaneous),
+	 * disconnect_order=0 (overload first), and gb_hysteresis
+	 * derived from the guard band. */
+	poe_cmd_device_power_mgmt(mcu, 1, 0, 0,
+				   (uint8_t)(cfg->budget_guard * 10));
+
+	/* Stock: bcm59111_cmd_set enum 7 = 0x07. Sets max per-port power
+	 * for class-based limits. 802.3at class 4 = 31.2W (value 2). */
+	poe_cmd_high_power_limit(mcu, 2);
+
 	poe_port_setup(mcu, cfg);
 
+	/* Stock: board_poe_led_init queries LED config once at init.
+	 * Previously in state_timeout_cb but MCU timeout drained the
+	 * entire pending queue, consistently dropping these trailing
+	 * commands. Query at init where the queue is uncontested.
+	 * Ref: Hurricos/realtek-poe#66 */
+	poe_cmd_port_led_config(mcu);
+	poe_cmd_system_led_config(mcu);
+	for (i = 0; i < cfg->port_count; i += 8)
+		poe_cmd_port_led_map(mcu, i);
+
 	return 0;
+}
+
+static void poe_check_power_threshold(struct poe_ctx *poe)
+{
+	const struct config *cfg = &poe->config;
+	const struct mcu_state *state = &poe->mcu.state;
+	struct blob_buf *b = &poe->blob_buf;
+	float pct;
+	const char *event;
+
+	if (cfg->threshold_high <= 0.0 || cfg->budget <= 0.0)
+		return;
+
+	pct = state->power_consumption / cfg->budget * 100.0;
+
+	if (!poe->threshold_over_active && pct >= cfg->threshold_high) {
+		poe->threshold_over_active = 1;
+		event = "over";
+	} else if (poe->threshold_over_active && pct <= cfg->threshold_low) {
+		poe->threshold_over_active = 0;
+		event = "below";
+	} else {
+		return;
+	}
+
+	ULOG_INFO("Power usage goes %s Threshold: %d%% (consumption=%.1fW budget=%.1fW)\n",
+		    event, (int)pct, state->power_consumption, cfg->budget);
+
+	blob_buf_init(b, 0);
+	blobmsg_add_string(b, "event", event);
+	blobmsg_add_double(b, "consumption", state->power_consumption);
+	blobmsg_add_double(b, "budget", cfg->budget);
+	blobmsg_add_double(b, "percentage", pct);
+	blobmsg_add_double(b, "threshold_high", cfg->threshold_high);
+	blobmsg_add_double(b, "threshold_low", cfg->threshold_low);
+	ubus_send_event(&poe->conn.ctx, "poe.power_threshold", b->head);
+}
+
+static int port_status_is_fault(const char *status)
+{
+	if (!status)
+		return 0;
+	return !strcmp(status, "Fault") || !strcmp(status, "Other fault");
+}
+
+/* Stock: 0x21 reply byte[4] fault_type enumeration.
+ * Maps directly to text_poe_portStatusDescStr in libsal.so. */
+static const char *fault_type_str(uint8_t fault_type)
+{
+	static const char *names[] = {
+		[0] = "ovlo",
+		[1] = "mps_absent",
+		[2] = "short",
+		[3] = "overload",
+		[4] = "denied",
+		[5] = "thermal",
+		[6] = "startup_failure",
+		[7] = "uvlo",
+	};
+	return GET_STR(fault_type, names);
+}
+
+static void poe_check_port_status_changes(struct poe_ctx *poe)
+{
+	const struct mcu_state *state = &poe->mcu.state;
+	const struct config *cfg = &poe->config;
+	struct blob_buf *b = &poe->blob_buf;
+	unsigned int i;
+
+	if (!poe->port_status_initialized) {
+		for (i = 0; i < cfg->port_count && i < MAX_PORT; i++) {
+			poe->last_port_status[i] = state->ports[i].status;
+			poe->last_port_class[i] = state->ports[i].class_info;
+			poe->last_cnt_overload[i] = state->ports[i].cnt_overload;
+			poe->last_cnt_short[i] = state->ports[i].cnt_short;
+			poe->last_cnt_denied[i] = state->ports[i].cnt_denied;
+			poe->last_cnt_mps_absent[i] = state->ports[i].cnt_mps_absent;
+			poe->last_cnt_invalid_signature[i] = state->ports[i].cnt_invalid_signature;
+		}
+		poe->port_status_initialized = 1;
+		return;
+	}
+
+	for (i = 0; i < cfg->port_count && i < MAX_PORT; i++) {
+		const struct port_state *p = &state->ports[i];
+		const char *cur = p->status;
+		const char *prev = poe->last_port_status[i];
+		uint8_t cur_cls = p->class_info;
+		uint8_t prev_cls = poe->last_port_class[i];
+		int status_changed = (cur != prev) && (!cur || !prev || strcmp(cur, prev));
+		int class_changed = cur_cls != prev_cls;
+		int is_fault = port_status_is_fault(cur);
+		char fault_reason[128];
+
+		fault_reason[0] = '\0';
+		if (is_fault) {
+			const char *ft = fault_type_str(p->fault_type);
+			if (ft)
+				snprintf(fault_reason, sizeof(fault_reason), "%s", ft);
+			else
+				snprintf(fault_reason, sizeof(fault_reason),
+					 "unknown(%d)", p->fault_type);
+		}
+
+		if (status_changed || class_changed) {
+			ULOG_INFO("Port %s status: %s -> %s (class %d -> %d)%s%s\n",
+				  cfg->ports[i].name,
+				  prev ? prev : "(none)", cur ? cur : "(none)",
+				  prev_cls, cur_cls,
+				  is_fault ? " fault=" : "",
+				  is_fault ? (fault_reason[0] ? fault_reason : "unknown") : "");
+
+			blob_buf_init(b, 0);
+			blobmsg_add_string(b, "port", cfg->ports[i].name);
+			blobmsg_add_u32(b, "index", i + 1);
+			blobmsg_add_string(b, "status", cur ? cur : "");
+			blobmsg_add_string(b, "prev_status", prev ? prev : "");
+			blobmsg_add_u32(b, "class", cur_cls);
+			blobmsg_add_u32(b, "prev_class", prev_cls);
+			blobmsg_add_double(b, "watt", p->watt);
+			blobmsg_add_u8(b, "fault", is_fault);
+			if (is_fault)
+				blobmsg_add_string(b, "fault_reason",
+					fault_reason[0] ? fault_reason : "unknown");
+			ubus_send_event(&poe->conn.ctx, "poe.port_status", b->head);
+		}
+
+		poe->last_port_status[i] = cur;
+		poe->last_port_class[i] = cur_cls;
+		poe->last_cnt_overload[i] = p->cnt_overload;
+		poe->last_cnt_short[i] = p->cnt_short;
+		poe->last_cnt_denied[i] = p->cnt_denied;
+		poe->last_cnt_mps_absent[i] = p->cnt_mps_absent;
+		poe->last_cnt_invalid_signature[i] = p->cnt_invalid_signature;
+	}
 }
 
 static void state_timeout_cb(struct uloop_timeout *t)
@@ -987,9 +1460,21 @@ static void state_timeout_cb(struct uloop_timeout *t)
 		return;
 	}
 
+	poe_check_power_threshold(poe);
+	poe_check_port_status_changes(poe);
+
 	poe_cmd_power_stats(mcu);
-	if (poe->hardcore_hacking_mode_en)
+	mcu->state.allocated_power = 0;
+	if (cfg->port_count <= 4) {
+		poe_cmd_pse_power(mcu, 0, 1, 2, 3);
+	} else {
+		poe_cmd_pse_power(mcu, 0, 1, 2, 3);
+		poe_cmd_pse_power(mcu, 4, 5, 6, 7);
+	}
+	if (poe->hardcore_hacking_mode_en) {
 		poe_cmd_get_extended_config(mcu);
+		poe_cmd_power_mgmt(mcu, 0);
+	}
 
 	if (mcu->dialect.desc->ops->poll_async) {
 		mcu->dialect.desc->ops->poll_async(mcu, cfg);
@@ -1002,12 +1487,13 @@ static void state_timeout_cb(struct uloop_timeout *t)
 		if (poe->hardcore_hacking_mode_en) {
 			poe_cmd_port_status(mcu, i);
 			poe_cmd_port_config(mcu, i);
+			poe_cmd_port_counters(mcu, i);
 		}
 
 		poe_cmd_port_power_stats(mcu, i);
 	}
 
-	uloop_timeout_set(t, 2 * 1000);
+	uloop_timeout_set(t, cfg->poll_interval_ms);
 }
 
 static int ubus_poe_info_cb(struct ubus_context *ctx, struct ubus_object *obj,
@@ -1021,6 +1507,14 @@ static int ubus_poe_info_cb(struct ubus_context *ctx, struct ubus_object *obj,
 	char tmp[16];
 	size_t i;
 	void *c;
+	int any_port_status = 0;
+
+	for (i = 0; i < cfg->port_count; i++) {
+		if (cfg->ports[i].valid && state->ports[i].status) {
+			any_port_status = 1;
+			break;
+		}
+	}
 
 	blob_buf_init(b, 0);
 
@@ -1031,6 +1525,7 @@ static int ubus_poe_info_cb(struct ubus_context *ctx, struct ubus_object *obj,
 		blobmsg_add_string(b, "mcu", state->sys_mcu);
 	blobmsg_add_double(b, "budget", cfg->budget);
 	blobmsg_add_double(b, "consumption", state->power_consumption);
+	blobmsg_add_double(b, "allocated", state->allocated_power);
 
 	c = blobmsg_open_table(b, "ports");
 	for (i = 0; i < cfg->port_count; i++) {
@@ -1047,10 +1542,21 @@ static int ubus_poe_info_cb(struct ubus_context *ctx, struct ubus_object *obj,
 			blobmsg_add_string(b, "mode", state->ports[i].poe_mode);
 		if (state->ports[i].status)
 			blobmsg_add_string(b, "status", state->ports[i].status);
+		else if (!any_port_status)
+			blobmsg_add_string(b, "status", "initializing");
 		else
 			blobmsg_add_string(b, "status", "unknown");
 		if (state->ports[i].watt)
 			blobmsg_add_double(b, "consumption", state->ports[i].watt);
+		if (state->ports[i].voltage)
+			blobmsg_add_double(b, "voltage_mv", state->ports[i].voltage);
+		if (state->ports[i].current)
+			blobmsg_add_u32(b, "current_ma", (uint32_t)state->ports[i].current);
+		if (state->ports[i].temperature)
+			blobmsg_add_double(b, "temperature_c", state->ports[i].temperature);
+		blobmsg_add_u32(b, "power_limit_type", state->ports[i].power_limit_type);
+		if (state->ports[i].power_budget)
+			blobmsg_add_double(b, "power_budget", state->ports[i].power_budget);
 
 		blobmsg_close_table(b, p);
 	}
@@ -1075,6 +1581,14 @@ static int ubus_poe_debug_cb(struct ubus_context *ctx, struct ubus_object *obj,
 	blob_buf_init(b, 0);
 
 	blobmsg_add_double(b, "reported_budget", state->reported_power_budget);
+	blobmsg_add_u32(b, "pse_id", state->pse_id);
+	blobmsg_add_u32(b, "high_power", state->high_power);
+	blobmsg_add_u32(b, "gb_hysteresis", state->gb_hysteresis);
+	blobmsg_add_u32(b, "pm_mode", state->pm_mode);
+	blobmsg_add_double(b, "pm_power_limit_0", state->pm_power_limit[0]);
+	blobmsg_add_double(b, "pm_guard_band_0", state->pm_guard_band[0]);
+	blobmsg_add_double(b, "pm_power_limit_1", state->pm_power_limit[1]);
+	blobmsg_add_double(b, "pm_guard_band_1", state->pm_guard_band[1]);
 
 
 	blobmsg_add_u32(b, "num_detected_ports", state->num_detected_ports);
@@ -1102,7 +1616,11 @@ static int ubus_poe_debug_cb(struct ubus_context *ctx, struct ubus_object *obj,
 		blobmsg_add_double(b, "power_budget", state->ports[i].power_budget);
 		blobmsg_add_u32(b, "priority", state->ports[i].priority);
 		blobmsg_add_u32(b, "primary_pse_output", state->ports[i].primary_pse_output);
+		blobmsg_add_u32(b, "primary_power_limit", state->ports[i].primary_power_limit);
 		blobmsg_add_u32(b, "mapping", state->ports[i].mapping);
+		blobmsg_add_double(b, "voltage_mv", state->ports[i].voltage);
+		blobmsg_add_u32(b, "current_ma", (uint32_t)state->ports[i].current);
+		blobmsg_add_double(b, "temperature_c", state->ports[i].temperature);
 
 		if (state->ports[i].has_config_info) {
 			blobmsg_add_u32(b, "enabled", state->ports[i].enabled);
@@ -1114,9 +1632,25 @@ static int ubus_poe_debug_cb(struct ubus_context *ctx, struct ubus_object *obj,
 		}
 
 		if (state->ports[i].has_detailed_state) {
+			blobmsg_add_u32(b, "fault_type", state->ports[i].fault_type);
 			blobmsg_add_u32(b, "class_info", state->ports[i].class_info);
 			blobmsg_add_u32(b, "pd_type", state->ports[i].pd_type);
 			blobmsg_add_u32(b, "mpss_mask", state->ports[i].mpss_mask);
+			blobmsg_add_u32(b, "power_mode", state->ports[i].power_mode);
+			blobmsg_add_u32(b, "chan_pwr", state->ports[i].chan_pwr);
+			blobmsg_add_u32(b, "pd_alt", state->ports[i].pd_alt);
+		}
+
+		if (state->ports[i].cnt_overload || state->ports[i].cnt_short ||
+		    state->ports[i].cnt_denied || state->ports[i].cnt_mps_absent ||
+		    state->ports[i].cnt_invalid_signature) {
+			void *ctrs = blobmsg_open_table(b, "counters");
+			blobmsg_add_u32(b, "overload", state->ports[i].cnt_overload);
+			blobmsg_add_u32(b, "short", state->ports[i].cnt_short);
+			blobmsg_add_u32(b, "denied", state->ports[i].cnt_denied);
+			blobmsg_add_u32(b, "mps_absent", state->ports[i].cnt_mps_absent);
+			blobmsg_add_u32(b, "invalid_signature", state->ports[i].cnt_invalid_signature);
+			blobmsg_close_table(b, ctrs);
 		}
 
 		blobmsg_close_table(b, p);
@@ -1183,6 +1717,51 @@ ubus_poe_sendframe_cb(struct ubus_context *ctx, struct ubus_object *obj,
 	return (ret < 0) ?  UBUS_STATUS_SYSTEM_ERROR : UBUS_STATUS_OK;
 }
 
+static const struct blobmsg_policy ubus_poe_rawframe_policy[] = {
+	{ "frame", BLOBMSG_TYPE_STRING },
+};
+
+static int
+ubus_poe_rawframe_cb(struct ubus_context *ctx, struct ubus_object *obj,
+		     struct ubus_request_data *req, const char *method,
+		     struct blob_attr *msg)
+{
+	struct blob_attr *tb[ARRAY_SIZE(ubus_poe_rawframe_policy)];
+	struct poe_ctx *poe = ubus_to_poe_ctx(ctx);
+	struct mcu *mcu = &poe->mcu;
+	char *frame, *next, *end;
+	size_t cmd_len = 0;
+	unsigned long byte_val;
+	uint8_t cmd[CMD_SIZE];
+	int ret;
+
+	if (!poe->hardcore_hacking_mode_en)
+		return UBUS_STATUS_PERMISSION_DENIED;
+
+	blobmsg_parse(ubus_poe_rawframe_policy,
+		      ARRAY_SIZE(ubus_poe_rawframe_policy),
+		      tb, blob_data(msg), blob_len(msg));
+	if (!*tb)
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	frame = blobmsg_get_string(*tb);
+	end = frame + strlen(frame);
+	next = frame;
+
+	while ((next < end) && (cmd_len < sizeof(cmd))) {
+		errno = 0;
+		byte_val = strtoul(frame, &next, 16);
+		if (errno || (frame == next) || (byte_val > 0xff))
+			return UBUS_STATUS_INVALID_ARGUMENT;
+
+		cmd[cmd_len++] = byte_val;
+		frame = next;
+	}
+
+	ret = mcu_queue_buf(mcu, cmd, cmd_len);
+	return (ret < 0) ? UBUS_STATUS_SYSTEM_ERROR : UBUS_STATUS_OK;
+}
+
 static int ubus_poe_reload_cb(struct ubus_context *ctx, struct ubus_object *obj,
 			      struct ubus_request_data *req, const char *method,
 			      struct blob_attr *msg)
@@ -1197,7 +1776,7 @@ static int ubus_poe_reload_cb(struct ubus_context *ctx, struct ubus_object *obj,
 
 static const struct blobmsg_policy ubus_poe_manage_policy[] = {
 	{ "port", BLOBMSG_TYPE_STRING },
-	{ "enable", BLOBMSG_TYPE_BOOL },
+	{ "action", BLOBMSG_TYPE_STRING },
 };
 
 static int ubus_poe_manage_cb(struct ubus_context *ctx, struct ubus_object *obj,
@@ -1209,7 +1788,9 @@ static int ubus_poe_manage_cb(struct ubus_context *ctx, struct ubus_object *obj,
 	const struct config *cfg = &poe->config;
 	const struct port_config *port;
 	struct mcu *mcu = &poe->mcu;
-	const char *port_name;
+	const char *port_name, *action;
+	bool enable;
+	int ret;
 	size_t i;
 
 	blobmsg_parse(ubus_poe_manage_policy,
@@ -1219,21 +1800,246 @@ static int ubus_poe_manage_cb(struct ubus_context *ctx, struct ubus_object *obj,
 		return UBUS_STATUS_INVALID_ARGUMENT;
 
 	port_name = blobmsg_get_string(tb[0]);
+	action = blobmsg_get_string(tb[1]);
+
+	if (!strcmp(action, "enable"))
+		enable = true;
+	else if (!strcmp(action, "disable"))
+		enable = false;
+	else if (!strcmp(action, "clear_counters")) {
+		ret = poe_cmd_clear_counters(mcu);
+		return (ret < 0) ? UBUS_STATUS_SYSTEM_ERROR : UBUS_STATUS_OK;
+	} else if (!strcmp(action, "reset")) {
+		/* Allow reset on any port, including disabled (upstream #58) */
+		for (i = 0; i < cfg->port_count; i++) {
+			port = &cfg->ports[i];
+			if (strcmp(port_name, port->name))
+				continue;
+			ret = poe_cmd_port_reset(mcu, i);
+			return (ret < 0) ? UBUS_STATUS_SYSTEM_ERROR : UBUS_STATUS_OK;
+		}
+		return UBUS_STATUS_NOT_FOUND;
+	} else
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
 	for (i = 0; i < cfg->port_count; i++) {
 		port = &cfg->ports[i];
 		if (!port->enable || strcmp(port_name, port->name))
 			continue;
-		return poe_cmd_port_enable(mcu, i, blobmsg_get_bool(tb[1]));
+		ret = poe_cmd_port_enable(mcu, i, enable);
+		return (ret < 0) ? UBUS_STATUS_SYSTEM_ERROR : UBUS_STATUS_OK;
 	}
+	return UBUS_STATUS_OK;
+}
+
+static const struct blobmsg_policy ubus_poe_set_port_config_policy[] = {
+	{ "port", BLOBMSG_TYPE_STRING },
+	{ "enable", BLOBMSG_TYPE_BOOL },
+	{ "priority", BLOBMSG_TYPE_INT32 },
+	{ "power_limit_type", BLOBMSG_TYPE_INT32 },
+	{ "power_limit", BLOBMSG_TYPE_INT32 },
+};
+
+static int ubus_poe_set_port_config_cb(struct ubus_context *ctx,
+					struct ubus_object *obj,
+					struct ubus_request_data *req,
+					const char *method,
+					struct blob_attr *msg)
+{
+	struct poe_ctx *poe = ubus_to_poe_ctx(ctx);
+	struct blob_attr *tb[ARRAY_SIZE(ubus_poe_set_port_config_policy)];
+	struct blob_attr *attr;
+	const char *port_name;
+	size_t i;
+
+	blobmsg_parse(ubus_poe_set_port_config_policy,
+		      ARRAY_SIZE(ubus_poe_set_port_config_policy),
+		      tb, blob_data(msg), blob_len(msg));
+
+	attr = tb[0];
+	if (!attr)
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	port_name = blobmsg_get_string(attr);
+
+	for (i = 0; i < poe->config.port_count; i++) {
+		if (!poe->config.ports[i].valid)
+			continue;
+		if (strcmp(poe->config.ports[i].name, port_name))
+			continue;
+
+		if (tb[1])
+			poe_cmd_port_enable(&poe->mcu, i, blobmsg_get_bool(tb[1]));
+
+		if (tb[2]) {
+			uint8_t prio = blobmsg_get_u32(tb[2]);
+			uint8_t port_ids[4] = {i, 0xff, 0xff, 0xff};
+			uint8_t priorities[4] = {prio, 0xff, 0xff, 0xff};
+
+			if (prio > 3)
+				return UBUS_STATUS_INVALID_ARGUMENT;
+			poe_set_port_priority(&poe->mcu, port_ids, priorities);
+		}
+
+		if (tb[3]) {
+			uint8_t limit_type = blobmsg_get_u32(tb[3]);
+			uint8_t port_ids[4] = {i, 0xff, 0xff, 0xff};
+			uint8_t limit_types[4] = {limit_type, 0xff, 0xff, 0xff};
+
+			if (limit_type > 2)
+				return UBUS_STATUS_INVALID_ARGUMENT;
+			poe_cmd_port_power_limit_type(&poe->mcu, port_ids,
+						      limit_types);
+
+			/* MCU retains stale budget across limit_type changes;
+			 * clear it by sending 15.4W class-3 max (77 × 0.2W) */
+			if (limit_type == 1 && !tb[4])
+				poe_cmd_port_power_budget(&poe->mcu, i, 77);
+
+			poe->config.ports[i].power_limit_type = limit_type;
+			if (limit_type != 2)
+				poe->config.ports[i].power_limit_mw = 0;
+		}
+
+		if (tb[4]) {
+			uint32_t limit_mw = blobmsg_get_u32(tb[4]);
+			uint8_t budget;
+
+			if (limit_mw > 33000)
+				return UBUS_STATUS_INVALID_ARGUMENT;
+			budget = limit_mw / 200;
+			if (!budget)
+				budget = 1;
+			poe_cmd_port_power_budget(&poe->mcu, i, budget);
+			poe->config.ports[i].power_limit_mw = limit_mw;
+		}
+
+		return UBUS_STATUS_OK;
+	}
+
+	return UBUS_STATUS_NOT_FOUND;
+}
+
+/* ubus call poe leds — Read-only LED status retrieval.
+ * Pattern from grobian PR Hurricos/realtek-poe#48, adapted for our struct layout. */
+static const char *sys_led_mode[] = {
+	"off", "on", "blink slow", "blink fast", "on when PoE+", "on when PoE"
+};
+
+static const char *blink_override_mode[] = {
+	"none",
+	"blink when port status is 'requesting'",
+	"blink when port status is 'fault'",
+	"blink when port status is 'requesting' or 'fault'"
+};
+
+static void led_state_to_str(char *buf, size_t len, uint8_t state,
+			     uint8_t led_count, uint8_t check_mask,
+			     uint8_t true_val, uint8_t false_val)
+{
+	const char *on_str;
+
+	if (led_count == 1) {
+		on_str = GET_STR(state & 1 ? (state & check_mask ? true_val : 1) : false_val,
+				 sys_led_mode);
+		snprintf(buf, len, "led %s", on_str ? on_str : "unknown");
+	} else {
+		const char *l1, *l2;
+		l1 = GET_STR(state & 1 ? (state & check_mask ? true_val : 1) : false_val,
+			      sys_led_mode);
+		l2 = GET_STR(state & 2 ? (state & check_mask ? true_val : 1) : false_val,
+			      sys_led_mode);
+		snprintf(buf, len, "led 1 %s, led 2 %s",
+			 l1 ? l1 : "unknown", l2 ? l2 : "unknown");
+	}
+}
+
+static int ubus_poe_leds_cb(struct ubus_context *ctx, struct ubus_object *obj,
+			    struct ubus_request_data *req, const char *method,
+			    struct blob_attr *msg)
+{
+	struct poe_ctx *poe = ubus_to_poe_ctx(ctx);
+	const struct mcu_state *state = &poe->mcu.state;
+	const struct config *cfg = &poe->config;
+	struct blob_buf *b = &poe->blob_buf;
+	char tmp[64];
+	void *c;
+	size_t i;
+
+	blob_buf_init(b, 0);
+
+	c = blobmsg_open_table(b, "system");
+	blobmsg_add_u8(b, "sys_ok", state->sys_led_config.sys_ok);
+	blobmsg_add_u8(b, "in_gb", state->sys_led_config.in_gb);
+	blobmsg_add_u8(b, "out_of_gb", state->sys_led_config.out_of_gb);
+	blobmsg_add_u8(b, "exceeds_ps", state->sys_led_config.exceeds_ps);
+	blobmsg_add_u32(b, "out_of_gb_off_delay",
+			state->sys_led_config.out_of_gb_off_delay);
+	blobmsg_add_u32(b, "exceeds_ps_off_delay",
+			state->sys_led_config.exceeds_ps_off_delay);
+	blobmsg_add_u8(b, "map_enable", state->sys_led_config.map_enable);
+	blobmsg_close_table(b, c);
+
+	c = blobmsg_open_table(b, "map");
+	for (i = 0; i < cfg->port_count; i++) {
+		const struct port_led_map *map = &state->led_maps[i / 8];
+		if (i % 8 == 0)
+			blobmsg_add_u32(b, "offset", map->offset);
+		blobmsg_add_u32(b, cfg->ports[i].name, map->ports[i % 8]);
+	}
+	blobmsg_close_table(b, c);
+
+	c = blobmsg_open_table(b, "port");
+	blobmsg_add_u8(b, "enable", state->port_led_config.enable);
+	blobmsg_add_string(b, "interface",
+			   state->port_led_config.interface ? "GPIO" : "SPI");
+	blobmsg_add_string(b, "shift_order",
+			   state->port_led_config.shift_order ? "MSB" : "LSB");
+	blobmsg_add_u32(b, "port_led_count", state->port_led_config.led_count);
+
+	led_state_to_str(tmp, sizeof(tmp), state->port_led_config.state_off,
+			 state->port_led_config.led_count, 0, 0, 0);
+	blobmsg_add_string(b, "state_off", tmp);
+
+	led_state_to_str(tmp, sizeof(tmp), state->port_led_config.state_req,
+			 state->port_led_config.led_count, 0x80, 2, 0);
+	blobmsg_add_string(b, "state_req", tmp);
+
+	led_state_to_str(tmp, sizeof(tmp), state->port_led_config.state_err,
+			 state->port_led_config.led_count, 0x80, 3, 0);
+	blobmsg_add_string(b, "state_err", tmp);
+
+	if (state->port_led_config.state_on & 0x40 &&
+	    state->port_led_config.led_count == 2)
+		led_state_to_str(tmp, sizeof(tmp), state->port_led_config.state_on,
+				 state->port_led_config.led_count, 0x40, 4, 5);
+	else
+		led_state_to_str(tmp, sizeof(tmp), state->port_led_config.state_on,
+				 state->port_led_config.led_count, 0, 0, 0);
+	blobmsg_add_string(b, "state_on", tmp);
+
+	{
+		const char *bo = GET_STR(state->port_led_config.blink_override,
+					 blink_override_mode);
+		blobmsg_add_string(b, "blink_override", bo ? bo : "unknown");
+	}
+	blobmsg_close_table(b, c);
+
+	ubus_send_reply(ctx, req, b->head);
+
 	return UBUS_STATUS_OK;
 }
 
 static const struct ubus_method ubus_poe_methods[] = {
 	UBUS_METHOD_NOARG("info", ubus_poe_info_cb),
 	UBUS_METHOD_NOARG("debug", ubus_poe_debug_cb),
+	UBUS_METHOD_NOARG("leds", ubus_poe_leds_cb),
 	UBUS_METHOD_NOARG("reload", ubus_poe_reload_cb),
 	UBUS_METHOD("sendframe", ubus_poe_sendframe_cb, ubus_poe_sendframe_policy),
+	UBUS_METHOD("rawframe", ubus_poe_rawframe_cb, ubus_poe_rawframe_policy),
 	UBUS_METHOD("manage", ubus_poe_manage_cb, ubus_poe_manage_policy),
+	UBUS_METHOD("set_port_config", ubus_poe_set_port_config_cb,
+		    ubus_poe_set_port_config_policy),
 };
 
 static struct ubus_object_type ubus_poe_object_type =

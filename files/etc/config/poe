@@ -1,5 +1,7 @@
 config global
 	option budget	'170'
+	# option power_threshold_high	'90'	# emit ubus event when usage % >= this
+	# option power_threshold_low	'80'	# emit "below" event when usage % drops to this (hysteresis)
 
 config port
 	option enable	'1'

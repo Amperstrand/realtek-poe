@@ -12,8 +12,12 @@ static const struct dialect_map_entry bcm_dialect_mapping[] = {
 	[PORT_SET_PRIORITY]		= {0x1a, CMD_IS_4PORT},
 	[PORT_SET_POE_MODE]		= {0x1c, CMD_IS_4PORT},
 	[PORT_SET_DISCONNECT_TYPE]	= {0x13, CMD_HAS_ALL_PORT},
+	[PORT_RESET]			= {0x03, 1},
 	[PORT_SET_POWER_LIMIT_TYPE]	= {0x15, CMD_IS_4PORT},
 	[PORT_SET_POWER_LIMIT]		= {0x16, 1},
+	[MCU_CLEAR_COUNTERS]		= {0x05, 1},
+	[MCU_SET_DEVICE_POWER_MGMT]	= {0x0b, 1},
+	[MCU_SET_HIGH_POWER_LIMIT]	= {0x07, 1},
 
 	[MCU_GET_SYSTEM_INFO]		= {0x20, 1},
 	[MCU_GET_POWER_STATS]		= {0x23, 1},
@@ -23,6 +27,15 @@ static const struct dialect_map_entry bcm_dialect_mapping[] = {
 	[PORT_GET_EXT_CONFIG]		= {0x26, 1},
 	[PORT_GET_SHORT_STATUS]		= {0x28, CMD_IS_4PORT},
 	[PORT_GET_POWER_STATS]		= {0x30, 1},
+	[MCU_GET_PSE_POWER]		= {0x29, 1},
+	[PORT_GET_COUNTERS]		= {0x22, 1},
+	[MCU_GET_POWER_MGMT]		= {0x27, 1},
+
+	/* LED read commands (0x41-0x49)
+	 * Protocol: svanheule.net; Stock: board_poe_portLed_set (0x39e8) */
+	[LED_GET_PORT_CONFIG]		= {0x42, 1},
+	[LED_GET_SYSTEM_CONFIG]	= {0x44, 1},
+	[LED_GET_PORT_MAP]		= {0x49, 1},
 };
 
 static const struct dialect_map bcm_dialect_map = {

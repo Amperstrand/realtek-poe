@@ -32,9 +32,14 @@ enum poe_cmd {
 	PORT_SET_PRIORITY,
 	PORT_SET_POE_MODE,
 	PORT_SET_DISCONNECT_TYPE,
+	PORT_RESET,
 	PORT_SET_POWER_LIMIT_TYPE,
 	PORT_SET_POWER_LIMIT,
 	PORT_SET_AUTO_POWERUP,
+
+	MCU_CLEAR_COUNTERS,
+	MCU_SET_DEVICE_POWER_MGMT,
+	MCU_SET_HIGH_POWER_LIMIT,
 
 	MCU_GET_SYSTEM_INFO,
 	MCU_GET_POWER_STATS,
@@ -44,6 +49,20 @@ enum poe_cmd {
 	PORT_GET_STATUS,
 	PORT_GET_SHORT_STATUS,
 	PORT_GET_POWER_STATS,
+	MCU_GET_PSE_POWER,
+	PORT_GET_COUNTERS,
+	MCU_GET_POWER_MGMT,
+
+	/* LED commands (wire 0x41-0x49)
+	 * Protocol: svanheule.net/switches/software/broadcom_poe_control_protocol
+	 * Stock: board_poe_led_set (0x3920), board_poe_portLed_set (0x39e8),
+	 *        board_poe_portLedCtrl_set (0x3cc4), board_poe_portLedEnable_set (0x3d6c)
+	 * GS1900-8HP: 2 LEDs/port, bi-color anti-parallel, SPI shift register, LSB first
+	 * Verified: grobian PR Hurricos/realtek-poe#48 on GS1900-8HP v1 */
+	LED_GET_PORT_CONFIG,	/* 0x42 */
+	LED_GET_SYSTEM_CONFIG,	/* 0x44 */
+	LED_GET_PORT_MAP,	/* 0x49 */
+
 	CMD_MAX
 };
 
@@ -60,6 +79,9 @@ struct port_state {
 	const char *poe_mode;
 	float power_budget;
 	float watt;
+	float voltage;
+	float current;
+	float temperature;
 
 	unsigned int has_config_info : 1;
 	unsigned int has_detailed_state : 1;
@@ -67,6 +89,7 @@ struct port_state {
 	uint8_t power_limit_type;
 	uint8_t priority;
 	uint8_t primary_pse_output;
+	uint8_t primary_power_limit;
 	uint8_t mapping;
 
 	uint8_t enabled;
@@ -76,9 +99,57 @@ struct port_state {
 	uint8_t disconnect_type;
 	uint8_t pair;
 
+	uint8_t fault_type;
 	uint8_t class_info;
 	uint8_t pd_type;
 	uint8_t mpss_mask;
+	uint8_t power_mode;
+	uint8_t chan_pwr;
+	uint8_t pd_alt;
+
+	uint16_t cnt_overload;
+	uint16_t cnt_short;
+	uint16_t cnt_denied;
+	uint16_t cnt_mps_absent;
+	uint16_t cnt_invalid_signature;
+};
+
+/* 0x42 reply: per-port LED configuration.
+ * state_off/req/err/on use packed bitmask <[B][S]0000[mm]>:
+ *   B=blink, S=PoE+ switch (2-LED only), mm=LED mask bits.
+ * For anti-parallel bi-color LEDs (GS1900-8HP): 00 and 11 = off, 01/10 = on.
+ */
+struct port_led_config {
+	uint8_t enable;		/* 0=MCU LED mgmt off, 1=on */
+	uint8_t interface;	/* 0=SPI shift register, 1=GPIO parallel */
+	uint8_t shift_order;	/* 0=LSB first, 1=MSB first */
+	uint8_t led_count;	/* 1 or 2 LEDs per port */
+	uint8_t state_off;	/* LED mask: disabled or searching */
+	uint8_t state_req;	/* LED mask: requesting power (bit7=blink 2Hz) */
+	uint8_t state_err;	/* LED mask: fault/other fault (bit7=blink 10Hz) */
+	uint8_t state_on;	/* LED mask: delivering power (bit6=PoE+ vs PoE switch) */
+	uint8_t blink_override;	/* 0=none, 1=requesting, 2=fault, 3=both */
+};
+
+/* 0x49 reply: port-to-LED position mapping. 8 ports per reply.
+ * GS1900-8HP: lan1=0, lan2=1, ... lan8=7 (sequential).
+ */
+struct port_led_map {
+	uint8_t offset;
+	uint8_t ports[8];
+};
+
+/* 0x44 reply: system-level PoE LED config (power budget indicator).
+ * sys_ok/in_gb/out_of_gb/exceeds_ps: 0=off, 1=on, 2=blink slow, 3=blink fast.
+ */
+struct system_led_config {
+	uint8_t sys_ok;
+	uint8_t in_gb;
+	uint8_t out_of_gb;
+	uint8_t exceeds_ps;
+	uint8_t out_of_gb_off_delay;
+	uint8_t exceeds_ps_off_delay;
+	uint8_t map_enable;
 };
 
 struct mcu_state {
@@ -87,6 +158,7 @@ struct mcu_state {
 	const char *sys_status;
 	float power_consumption;
 	float reported_power_budget;
+	float allocated_power;
 	float uvlo_threshold;
 	float ovlo_threshold;
 	unsigned int num_detected_ports;
@@ -104,7 +176,19 @@ struct mcu_state {
 	uint8_t ddflag;
 	uint8_t num_pse;
 
+	uint8_t pse_id;
+	uint8_t high_power;
+	uint8_t gb_hysteresis;
+
+	uint8_t pm_mode;
+	float pm_power_limit[2];
+	float pm_guard_band[2];
+
 	struct port_state ports[MAX_PORT];
+
+	struct port_led_config   port_led_config;
+	struct port_led_map      led_maps[(MAX_PORT + 7) / 8];
+	struct system_led_config sys_led_config;
 };
 
 struct port_config {
@@ -114,6 +198,8 @@ struct port_config {
 	uint8_t priority;
 	uint8_t power_up_mode;
 	uint8_t power_budget;
+	uint8_t power_limit_type;
+	uint16_t power_limit_mw;
 };
 
 struct dialect_desc;
@@ -124,7 +210,11 @@ struct config {
 	float budget;
 	float budget_guard;
 
+	float threshold_high;
+	float threshold_low;
+
 	unsigned int forced_baudrate;
+	unsigned int poll_interval_ms;
 	unsigned int port_count;
 	uint8_t pse_id_set_budget_mask;
 	struct port_config ports[MAX_PORT];

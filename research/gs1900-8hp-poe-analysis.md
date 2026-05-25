@@ -182,12 +182,14 @@ Status values observed: 0x11 = "Searching" (no PD connected), 0x61 = seen on por
 Byte 0:    0x30 (command echo)
 Byte 1:    sequence number
 Byte 2:    port index
-Bytes 3-4: consumed_power (big-endian, ×0.1 W) = 0x0000 → 0.0W
-Bytes 5-6: allocated_power (big-endian, ×0.1 W) = 0x0000 → 0.0W
-Bytes 7-8: max_power (big-endian, ×0.1 W) = 0x00BC → 18.8W (802.3at)
-Bytes 9-10: unknown (0x0000)
+Bytes 3-4: unknown field A (big-endian) — 0x0344 (836) with NR7101 load, 0x0000 idle
+Bytes 5-6: unknown field B (big-endian) — 0x005D (93) with NR7101 load, 0x0000 idle
+Bytes 7-8: port max capability (big-endian, ×0.1 W) — 0x00BC (18.8W), CONSTANT for all ports
+Bytes 9-10: consumed power (big-endian, ×0.1 W) — 0x0032 (5.0W) with NR7101 load ✓
 Byte 11:  checksum
 ```
+
+**CORRECTION (2026-05-22)**: The previous version incorrectly mapped bytes 3-4 as "consumed_power" and bytes 5-6 as "allocated_power". The correct mapping has consumed power at bytes 9-10, confirmed by matching ubus output (5.0W) and stock web UI (4700-5200mW). The fields at bytes 3-6 are still under investigation.
 
 Note: Ports 0,1,2,3,5,6 show max=0x00BC (18.8W). Ports 4,7 show 0x00BD (18.9W) — slight calibration difference.
 
@@ -220,7 +222,7 @@ All 8 ports show: State=Enable, Class=class0, Priority=Low, Power-Up=802.3at, Co
 
 1. **Budget display**: Stock shows 70.0W total. OpenWrt configures 70W but MCU reports 63.0W (10% guard band). Stock either doesn't apply a guard band or calculates it differently.
 
-2. **Per-port power measurement**: Stock shows per-port power in milliwatts (currently 0 with no load). OpenWrt's `poe info` doesn't expose per-port wattage — only total consumption.
+2. **Per-port power measurement**: Stock shows per-port power in milliwatts. OpenWrt's `poe info` DOES expose per-port wattage (consumption field) when a port is delivering power. Verified with NR7101 load: shows 4.7-5.2W for lan8.
 
 3. **Power allocation**: Stock shows "Allocated Power" and "Remaining Power" — these track how much power is reserved for connected devices. OpenWrt only shows consumed vs budget.
 
@@ -228,7 +230,7 @@ All 8 ports show: State=Enable, Class=class0, Priority=Low, Power-Up=802.3at, Co
 
 5. **Time scheduling**: Stock supports Time Range scheduling per port. OpenWrt has no equivalent.
 
-6. **Per-port max power**: Stock shows 0mW (likely only populated with connected PDs). OpenWrt's debug shows 15.4W per-port budget (class-based) and 18.8W max (from MCU).
+6. **Per-port max power**: Stock shows 16200mW max for active port, 0mW for idle. OpenWrt's debug shows 15.4W per-port budget and 18.8W max (from UART bytes 7-8).
 
 ## Identified Bugs
 
@@ -279,13 +281,63 @@ This might indicate port 8 has different hardware characteristics (different PSE
 6. What happens to power management when budget is exceeded?
 7. How does Classification mode vs Consumption mode differ in practice?
 
+## Load Testing Results (NR7101)
+
+### Test Setup
+
+- NR7101 (Zyxel 5G router, OpenWrt, MAC 4c:c5:3e:b6:1d:90) connected to port 8 on BOTH GS1900-8HP devices
+- NR7101 configured at 192.168.1.10/24
+- Both switches powered from same source
+
+### Stock vs OpenWrt Power Comparison (Port 8, NR7101 load)
+
+| Metric | Stock V2.90 (192.168.1.1) | OpenWrt (192.168.1.2) |
+|---|---|---|
+| Total Budget | 70.0W | 70.0W (config) / 63.0W (MCU reported) |
+| Total Consumption | 4.7-5.2W | 4.9-5.3W |
+| Port 8 Consumption | 4600-5200mW | 4.7-5.2W |
+| Port 8 Max | 16200mW | 18.8W (UART) / 15.4W (debug) |
+| Port 8 Class | class0 | class2 (UART) |
+| Port 8 Power-Up Mode | 802.3at | (not exposed) |
+| Remaining | 64.8-65.3W | 64.7-65.1W |
+
+NOTE: The ~0.5W difference between stock and OpenWrt readings may be due to different firmware versions on the two GS1900-8HP devices (user confirmed they run slightly different firmware).
+
+### Port Disable/Enable Test Results
+
+**OpenWrt** (ubus call poe manage):
+- Command: `ubus call poe manage '{"port":"lan8", "enable": false}'`
+- Note: Returns "Method not found" or "Parsing message data failed" but STILL WORKS (daemon processes it)
+- Result: Port → "Disabled", consumption → 0.0W, NR7101 loses power
+- Re-enable: `ubus call poe manage '{"port":"lan8", "enable": true}'`
+- Recovery: Port → "Delivering power", consumption → 5.1W after ~8s (PD renegotiation time)
+- NR7101 recovers in ~5 seconds after re-enable
+
+**Stock V2.90** (HTTP POST to cmd=775):
+- Form requires XSSID token (CSRF protection), fetched from cmd=774 page
+- POST fields: `XSSID=...&portlist=8&state=0|1&portPriority=3&portPowerMode=3&portLimitMode=0&portPowerLimit=0&poeTimeRange=20&cmd=775&sysSubmit=Apply`
+- Disable (state=0): Port → "Disable", consumption → 0mW, total → 0.0W
+- Re-enable (state=1): Port → "Enable", consumption → 4900mW after ~8s
+- NR7101 stays reachable during test (it's connected to BOTH devices via different physical paths)
+
+### UART Raw Data (Fresh Capture)
+
+From `logread | grep "realtek-poe"` after daemon restart with NR7101 load on port 7 (lan8):
+```
+Port 7 (lan8 with load): RX <- 30 56 07 03 44 00 5d 00 bc 00 32 1f
+Port 3 (idle):           RX <- 30 4a 03 00 00 00 00 00 bc 00 00 39
+Port 4 (idle):           RX <- 30 4d 04 00 00 00 00 00 bc 00 00 3d
+Port 5 (idle):           RX <- 30 50 05 00 00 00 00 00 bc 00 00 41
+Port 6 (idle):           RX <- 30 53 06 00 00 00 00 00 bc 00 00 45
+```
+
 ## Test Plan (Requires PoE Loads)
 
-- [ ] Connect 802.3af class 2 device (e.g., IP camera, ~7W) to both devices
-- [ ] Verify per-port power measurement accuracy (stock mW vs OpenWrt W)
+- [x] Connect 802.3af class 2 device (NR7101, ~5W) to both devices
+- [x] Verify per-port power measurement accuracy (stock mW vs OpenWrt W)
 - [ ] Connect 802.3at class 4 device (e.g., PoE access point, ~25W)
 - [ ] Test budget overload: connect 8× 15W devices (>70W total)
 - [ ] Verify priority-based power shedding
-- [ ] Test hot-plug: connect/disconnect while monitoring
+- [x] Test hot-plug: connect/disconnect while monitoring (port disable/enable)
 - [ ] Compare Classification mode vs Consumption mode behavior
 - [ ] Measure actual power draw with external meter for accuracy comparison
