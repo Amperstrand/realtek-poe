@@ -1349,30 +1349,20 @@ static int poe_initial_setup(struct mcu* mcu, const struct config *cfg)
 
 	poe_port_setup(mcu, cfg);
 
-	/* Stock: board_poe_led_init sends SET commands before GET queries.
-	 * Order: SET port LED config -> SET system LED config -> SET LED map
-	 *        -> enable port mapping -> GET all to verify.
+	/* Stock: board_poe_led_init queries LED config once at init.
+	 * Previously in state_timeout_cb but MCU timeout drained the
+	 * entire pending queue, consistently dropping these trailing
+	 * commands. Query at init where the queue is uncontested.
 	 *
-	 * GS1900-8HP: 2 bi-color anti-parallel LEDs per port, GPIO interface,
-	 * MSB shift. LED masks: 00/11=off (anti-parallel), 01/10=on.
-	 *   state_off  = 0x03 (both LEDs on -> anti-parallel cancels = off)
-	 *   state_req  = 0x83 (blink at 2Hz + both LEDs on)
-	 *   state_err  = 0x83 (blink at 10Hz + both LEDs on)
-	 *   state_on   = 0x03 (both LEDs on -> delivering power)
-	 *   blink_override = 3 (blink on requesting + fault)
+	 * Port mapping (0x02) enables the MCU to drive LEDs based on
+	 * the per-port PoE state. The MCU stores LED config and the
+	 * port-to-LED map in non-volatile memory, set by the factory
+	 * firmware. LED SET commands (0x41/0x43/0x48) are rejected by
+	 * the BCM59121 firmware (v17.1) on GS1900-8HP A1, so we only
+	 * enable mapping and read the stored config.
 	 * Ref: svanheule.net, grobian PR Hurricos/realtek-poe#48 */
-	poe_cmd_set_port_led_config(mcu, 1, 1, 1, 2,
-				    0x03, 0x83, 0x83, 0x03, 3);
-	poe_cmd_set_system_led_config(mcu, 1, 1, 2, 3,
-				      0xff, 0xff, 1);
-	{
-		uint8_t led_map[] = { 0, 1, 2, 3, 4, 5, 6, 7 };
-		for (i = 0; i < cfg->port_count; i += 8)
-			poe_cmd_set_port_led_map(mcu, i, led_map);
-	}
 	poe_cmd_port_mapping_enable(mcu, true);
 
-	/* Verify LED config took effect via GET queries */
 	poe_cmd_port_led_config(mcu);
 	poe_cmd_system_led_config(mcu);
 	for (i = 0; i < cfg->port_count; i += 8)
