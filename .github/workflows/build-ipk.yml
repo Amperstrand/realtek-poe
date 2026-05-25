@@ -38,7 +38,7 @@ jobs:
           docker run --rm \
             -v $GITHUB_WORKSPACE/bin:/home/build/openwrt/bin \
             -v $GITHUB_WORKSPACE:/home/build/openwrt/package/realtek-poe \
-            openwrt/sdk:realtek-rtl838x-snapshot \
+            openwrt/sdk:realtek-rtl838x-25.12.1 \
             /bin/bash -c " \
               ./scripts/feeds update base \
               && ./scripts/feeds install libubus libuci \
