@@ -56,19 +56,20 @@ jobs:
           SAFE_BRANCH="${BRANCH_NAME//\//-}"
           SHORT_SHA="${GITHUB_SHA:0:8}"
 
-          # Find and rename the .ipk
-          SRCDIR="bin/packages/mips_4kec/base"
-          if [ -d "$SRCDIR" ]; then
-            for f in "$SRCDIR"/realtek-poe_*.ipk; do
-              BASENAME=$(basename "$f")
-              # Insert branch+sha before .ipk extension
-              NEWNAME="${BASENAME%.ipk}_${SAFE_BRANCH}_${SHORT_SHA}.ipk"
-              cp "$f" "dist/$NEWNAME"
-              echo "Built: dist/$NEWNAME"
-            done
-          else
-            echo "ERROR: No .ipk found in $SRCDIR"
-            find bin -name "*.ipk" 2>/dev/null
+          # Find all .ipk files and copy to dist with branch+sha tag
+          FOUND=0
+          for f in $(find bin -name "realtek-poe_*.ipk" 2>/dev/null); do
+            BASENAME=$(basename "$f")
+            NEWNAME="${BASENAME%.ipk}_${SAFE_BRANCH}_${SHORT_SHA}.ipk"
+            cp "$f" "dist/$NEWNAME"
+            echo "Built: dist/$NEWNAME"
+            FOUND=1
+          done
+
+          if [ "$FOUND" = "0" ]; then
+            echo "ERROR: No realtek-poe .ipk found"
+            find bin -name "*.ipk" 2>/dev/null || echo "bin/ is empty or missing"
+            ls -la bin/ 2>/dev/null || true
             exit 1
           fi
 
