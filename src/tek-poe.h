@@ -62,6 +62,9 @@ enum poe_cmd {
 	LED_GET_PORT_CONFIG,	/* 0x42 */
 	LED_GET_SYSTEM_CONFIG,	/* 0x44 */
 	LED_GET_PORT_MAP,	/* 0x49 */
+	LED_SET_PORT_CONFIG,	/* 0x41 */
+	LED_SET_SYSTEM_CONFIG,	/* 0x43 */
+	LED_SET_PORT_MAP,	/* 0x48 */
 
 	CMD_MAX
 };

@@ -36,6 +36,9 @@ static const struct dialect_map_entry bcm_dialect_mapping[] = {
 	[LED_GET_PORT_CONFIG]		= {0x42, 1},
 	[LED_GET_SYSTEM_CONFIG]	= {0x44, 1},
 	[LED_GET_PORT_MAP]		= {0x49, 1},
+	[LED_SET_PORT_CONFIG]		= {0x41, 1},
+	[LED_SET_SYSTEM_CONFIG]	= {0x43, 1},
+	[LED_SET_PORT_MAP]		= {0x48, 1},
 };
 
 static const struct dialect_map bcm_dialect_map = {

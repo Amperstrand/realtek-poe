@@ -913,6 +913,54 @@ static int poe_reply_port_led_map(struct mcu_state *state, uint8_t *reply)
 	return 0;
 }
 
+/* 0x41 - Set port LED config. Mirror of 0x42 GET reply format.
+ * Stock: board_poe_portLed_set (0x39e8 in board_poe.ko). */
+static int poe_cmd_set_port_led_config(struct mcu *mcu, uint8_t enable,
+	uint8_t interface, uint8_t shift_order, uint8_t led_count,
+	uint8_t state_off, uint8_t state_req, uint8_t state_err,
+	uint8_t state_on, uint8_t blink_override)
+{
+	uint8_t cmd[] = {
+		LED_SET_PORT_CONFIG, 0x00,
+		enable, interface, shift_order, led_count,
+		state_off, state_req, state_err, state_on,
+		blink_override
+	};
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
+/* 0x43 - Set system LED config. Mirror of 0x44 GET reply format.
+ * Stock: board_poe_led_set (0x3920 in board_poe.ko). */
+static int poe_cmd_set_system_led_config(struct mcu *mcu, uint8_t sys_ok,
+	uint8_t in_gb, uint8_t out_of_gb, uint8_t exceeds_ps,
+	uint8_t out_of_gb_off_delay, uint8_t exceeds_ps_off_delay,
+	uint8_t map_enable)
+{
+	uint8_t cmd[] = {
+		LED_SET_SYSTEM_CONFIG, 0x00,
+		sys_ok, in_gb, out_of_gb, exceeds_ps,
+		out_of_gb_off_delay, exceeds_ps_off_delay, map_enable
+	};
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
+/* 0x48 - Set port LED map. Mirror of 0x49 GET reply format.
+ * Maps port (offset+i) to LED index led_indices[i].
+ * Stock: board_poe_portLedCtrl_set (0x3cc4 in board_poe.ko). */
+static int poe_cmd_set_port_led_map(struct mcu *mcu, uint8_t offset,
+	const uint8_t led_indices[8])
+{
+	uint8_t cmd[] = {
+		LED_SET_PORT_MAP, 0x00, offset,
+		led_indices[0], led_indices[1], led_indices[2], led_indices[3],
+		led_indices[4], led_indices[5], led_indices[6], led_indices[7]
+	};
+
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
 /* 0x22 - Get port counters. Stock bcm59111_portStats_get sends reset=1
  * to clear MCU single-byte counters after reading, preventing overflow. */
 static int poe_cmd_port_counters(struct mcu *mcu, uint8_t port)
@@ -1283,7 +1331,6 @@ static int poe_initial_setup(struct mcu* mcu, const struct config *cfg)
 
 	poe_cmd_status(mcu);
 	poe_cmd_power_mgmt_mode(mcu, 2);
-	poe_cmd_port_mapping_enable(mcu, false);
 	poe_set_power_budget(mcu, cfg);
 
 	/* Stock: poe_bcm59111_chip_init sends 0x0b with pre_alloc=1
@@ -1299,11 +1346,30 @@ static int poe_initial_setup(struct mcu* mcu, const struct config *cfg)
 
 	poe_port_setup(mcu, cfg);
 
-	/* Stock: board_poe_led_init queries LED config once at init.
-	 * Previously in state_timeout_cb but MCU timeout drained the
-	 * entire pending queue, consistently dropping these trailing
-	 * commands. Query at init where the queue is uncontested.
-	 * Ref: Hurricos/realtek-poe#66 */
+	/* Stock: board_poe_led_init sends SET commands before GET queries.
+	 * Order: SET port LED config -> SET system LED config -> SET LED map
+	 *        -> enable port mapping -> GET all to verify.
+	 *
+	 * GS1900-8HP: 2 bi-color anti-parallel LEDs per port, GPIO interface,
+	 * MSB shift. LED masks: 00/11=off (anti-parallel), 01/10=on.
+	 *   state_off  = 0x03 (both LEDs on -> anti-parallel cancels = off)
+	 *   state_req  = 0x83 (blink at 2Hz + both LEDs on)
+	 *   state_err  = 0x83 (blink at 10Hz + both LEDs on)
+	 *   state_on   = 0x03 (both LEDs on -> delivering power)
+	 *   blink_override = 3 (blink on requesting + fault)
+	 * Ref: svanheule.net, grobian PR Hurricos/realtek-poe#48 */
+	poe_cmd_set_port_led_config(mcu, 1, 1, 1, 2,
+				    0x03, 0x83, 0x83, 0x03, 3);
+	poe_cmd_set_system_led_config(mcu, 1, 1, 2, 3,
+				      0xff, 0xff, 1);
+	{
+		uint8_t led_map[] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+		for (i = 0; i < cfg->port_count; i += 8)
+			poe_cmd_set_port_led_map(mcu, i, led_map);
+	}
+	poe_cmd_port_mapping_enable(mcu, true);
+
+	/* Verify LED config took effect via GET queries */
 	poe_cmd_port_led_config(mcu);
 	poe_cmd_system_led_config(mcu);
 	for (i = 0; i < cfg->port_count; i += 8)
