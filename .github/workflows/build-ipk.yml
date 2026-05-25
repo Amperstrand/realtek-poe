@@ -18,6 +18,9 @@ on:
   pull_request:
     branches: [ "master", "realtek-poe" ]
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   build:
     name: Build
@@ -26,6 +29,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Short SHA
+        id: sha
+        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Copy-paste from openwrt action
         run: |
@@ -48,5 +55,5 @@ jobs:
       - name: Store packages
         uses: actions/upload-artifact@v4
         with:
-          name: mips_4kec-packages
+          name: realtek-poe-${{ steps.sha.outputs.short }}
           path: bin/packages/mips_4kec/base/realtek-poe_*.ipk
