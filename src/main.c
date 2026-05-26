@@ -1388,6 +1388,7 @@ static void poe_check_port_status_changes(struct poe_ctx *poe)
 			poe->last_cnt_denied[i] = state->ports[i].cnt_denied;
 			poe->last_cnt_mps_absent[i] = state->ports[i].cnt_mps_absent;
 			poe->last_cnt_invalid_signature[i] = state->ports[i].cnt_invalid_signature;
+			poe_led_update(i + 1, state->ports[i].status);
 		}
 		poe->port_status_initialized = 1;
 		return;
@@ -1421,6 +1422,8 @@ static void poe_check_port_status_changes(struct poe_ctx *poe)
 				  prev_cls, cur_cls,
 				  is_fault ? " fault=" : "",
 				  is_fault ? (fault_reason[0] ? fault_reason : "unknown") : "");
+
+			poe_led_update(i + 1, cur);
 
 			blob_buf_init(b, 0);
 			blobmsg_add_string(b, "port", cfg->ports[i].name);
@@ -2123,8 +2126,10 @@ int main(int argc, char **argv)
 
 
 	poe_initial_setup(&poe.mcu, &poe.config);
+	poe_led_init(poe.config.port_count);
 	uloop_timeout_set(&poe.state_timeout, 1000);
 	uloop_run();
+	poe_led_shutdown();
 	uloop_done();
 
 	return 0;

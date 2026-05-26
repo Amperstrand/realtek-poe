@@ -301,4 +301,9 @@ const char *port_short_status_to_str(uint8_t short_status);
 extern const struct dialect_desc broadcom_dialect;
 extern const struct dialect_desc realtek_dialect;
 
+/* LED control via RTL838x SoC LED engine (led.c) */
+int poe_led_init(unsigned int port_count);
+void poe_led_update(unsigned int poe_port_id, const char *status);
+void poe_led_shutdown(void);
+
 #endif /* TEK_POE_H */
