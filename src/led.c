@@ -33,6 +33,8 @@
 #include <unistd.h>
 #include <errno.h>
 
+#include <libubox/ulog.h>
+
 /* LED pattern values for group 0 bits [2:0] */
 #define LED_PATTERN_OFF		0	/* 000: solid OFF */
 #define LED_PATTERN_ON		5	/* 101: solid ON (most stable, std=2) */
