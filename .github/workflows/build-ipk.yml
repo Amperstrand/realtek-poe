@@ -17,6 +17,9 @@ on:
     branches: [ "ai-experiments" ]
   workflow_dispatch:  # Allow manual trigger from any branch
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   build:
     name: Build realtek-poe .ipk
