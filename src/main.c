@@ -1380,6 +1380,27 @@ static void poe_check_port_status_changes(struct poe_ctx *poe)
 	unsigned int i;
 
 	if (!poe->port_status_initialized) {
+		/*
+		 * Defer initialisation until the MCU has actually answered for
+		 * at least one port. If we initialise while every status is
+		 * still NULL (MCU booting / in reset loop), poe_led_update()
+		 * writes OFF for every port, port_status_initialized flips to
+		 * 1, and the subsequent NULL -> real-status transition is
+		 * masked because last_port_status[] was captured as NULL and
+		 * later polls may also briefly return NULL during reconnect.
+		 * Waiting for a real reply guarantees the first LED write
+		 * reflects an actual port state.
+		 */
+		int have_real_status = 0;
+		for (i = 0; i < cfg->port_count && i < MAX_PORT; i++) {
+			if (state->ports[i].status) {
+				have_real_status = 1;
+				break;
+			}
+		}
+		if (!have_real_status)
+			return;
+
 		for (i = 0; i < cfg->port_count && i < MAX_PORT; i++) {
 			poe->last_port_status[i] = state->ports[i].status;
 			poe->last_port_class[i] = state->ports[i].class_info;
