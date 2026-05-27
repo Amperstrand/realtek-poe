@@ -3,10 +3,14 @@
 /*
  * PoE LED control via RTL838x SoC LED engine registers.
  *
- * The GS1900-8HP drives PoE status LEDs through the SoC's built-in LED
- * engine, NOT through the BCM59111 MCU or RTL8231 GPIO. The stock Zyxel
+ * PoE status LEDs on RTL838x-based switches are driven by the SoC's built-in
+ * LED engine, NOT by the BCM59111 MCU or RTL8231 GPIO. The stock Zyxel
  * firmware uses board_poe_portLed_set() → board_led_portSwCtrl_set() to
  * write to SoC registers. We do the same from userspace via debugfs.
+ *
+ * Board detection reads /sys/firmware/devicetree/base/compatible and matches
+ * against a known-boards table to determine the PoE→SoC port mapping.
+ * Unknown boards get LED control disabled (safe default).
  *
  * Register map (physical base 0xBB000000):
  *   0xA00C  led_sw_ctrl          Global software control enable
@@ -17,8 +21,6 @@
  *
  * LED group 0, bits [2:0] control the PoE LED for each port:
  *   0 = OFF, 5 = ON (solid), 4 = FAST BLINK (~2 Hz), 7 = SLOW BLINK (~0.5 Hz)
- *
- * Port mapping for GS1900-8HP: lan1=SoC port 8, lan2=9, ..., lan8=15
  *
  * Verified with camera-based automated testing on GS1900-8HP A1 running
  * OpenWrt 25.12.1. See POE_PARITY.md for full RE and validation details.
@@ -45,22 +47,93 @@
 #define LED_DEBUGFS_PATH	"/sys/kernel/debug/rtl838x/led"
 #define LED_SW_CTRL		LED_DEBUGFS_PATH "/led_sw_ctrl"
 #define LED0_SW_P_EN_CTRL	LED_DEBUGFS_PATH "/led0_sw_p_en_ctrl"
-#define LED_P_CTRL(port)	LED_DEBUGFS_PATH "/led_sw_p_ctrl." #port
 
 /* Maximum SoC port number (for buffer sizing) */
 #define MAX_SOC_PORT		31
 
 /*
- * Platform-specific mapping: PoE port ID (1-based) → SoC LED port number.
- * GS1900-8HP: lan1..lan8 (port id 1..8) → SoC ports 8..15.
+ * Board-specific SoC LED port mapping.
+ * offset: poe_port_id + offset = SoC LED port number
+ * max_ports: number of PoE-capable ports on this board
+ */
+struct led_board_map {
+	const char *compatible;	/* Substring to match in DT compatible string */
+	int offset;
+	int max_ports;
+};
+
+static const struct led_board_map led_board_maps[] = {
+	/* Zyxel GS1900-8HP v1/v2: lan1..lan8 (port 1..8) → SoC ports 8..15 */
+	{ "zyxel,gs1900-8hp",	.offset = 7, .max_ports = 8 },
+	{ NULL, 0, 0 }	/* Sentinel — MUST be last */
+};
+
+/* Detected at init, used by poe_port_to_soc_port() */
+static int led_port_offset = -1;
+static int led_max_ports = 0;
+
+/*
+ * Detect board from device tree and populate led_port_offset/led_max_ports.
+ * Returns 0 on success (known board), -1 on failure (unknown board).
+ */
+static int detect_led_board(void)
+{
+	char compatible[256];
+	int fd, ret, i;
+	const char *p;
+
+	fd = open("/sys/firmware/devicetree/base/compatible", O_RDONLY);
+	if (fd < 0) {
+		ULOG_WARN("LED: cannot read device tree compatible: %s\n",
+			  strerror(errno));
+		return -1;
+	}
+
+	ret = read(fd, compatible, sizeof(compatible) - 1);
+	close(fd);
+	if (ret <= 0)
+		return -1;
+
+	compatible[ret] = '\0';
+
+	/* Walk null-separated compatible strings from device tree */
+	p = compatible;
+	while (p < compatible + ret) {
+		size_t plen = strlen(p);
+		if (!plen) {
+			p++;
+			continue;
+		}
+
+		for (i = 0; led_board_maps[i].compatible; i++) {
+			if (strstr(p, led_board_maps[i].compatible)) {
+				led_port_offset = led_board_maps[i].offset;
+				led_max_ports = led_board_maps[i].max_ports;
+				ULOG_INFO("LED: detected board '%s' → offset=%d, "
+					  "max_ports=%d\n", p,
+					  led_port_offset, led_max_ports);
+				return 0;
+			}
+		}
+
+		p += plen + 1;
+	}
+
+	return -1;
+}
+
+/*
+ * Map PoE port ID (1-based) to SoC LED port number using detected board.
  */
 static int poe_port_to_soc_port(unsigned int poe_port_id)
 {
-	/* GS1900-8HP: port 1 → SoC port 8, port 2 → 9, ..., port 8 → 15 */
-	if (poe_port_id >= 1 && poe_port_id <= 8)
-		return poe_port_id + 7;
+	if (led_port_offset < 0)
+		return -1;
 
-	return -1;
+	if (poe_port_id < 1 || poe_port_id > (unsigned int)led_max_ports)
+		return -1;
+
+	return (int)poe_port_id + led_port_offset;
 }
 
 /*
@@ -149,8 +222,8 @@ static int led_p_ctrl_path(int soc_port, char *buf, size_t buflen)
 
 /*
  * One-time initialization of the SoC LED engine for PoE LED control.
- * Enables global software control and sets up per-port enable bits
- * for all PoE ports.
+ * Detects the board, enables global software control, and sets up
+ * per-port enable bits for all PoE ports.
  *
  * Returns 0 on success, negative on failure.
  */
@@ -159,6 +232,13 @@ int poe_led_init(unsigned int port_count)
 	unsigned int i;
 	unsigned int en_mask = 0;
 	int ret;
+
+	/* Detect board and load port mapping */
+	if (detect_led_board() < 0) {
+		ULOG_INFO("LED: unknown board, PoE LED control disabled "
+			  "(add board to led_board_maps[] to enable)\n");
+		return -ENODEV;
+	}
 
 	/* Check if the debugfs interface exists */
 	ret = access(LED_SW_CTRL, W_OK);
@@ -171,7 +251,7 @@ int poe_led_init(unsigned int port_count)
 	/* Build the enable mask: set bit for each PoE port */
 	for (i = 0; i < port_count && i < MAX_PORT; i++) {
 		int soc_port = poe_port_to_soc_port(i + 1);
-		if (soc_port >= 0)
+		if (soc_port >= 0 && soc_port <= MAX_SOC_PORT)
 			en_mask |= (1u << soc_port);
 	}
 
@@ -243,6 +323,9 @@ void poe_led_update(unsigned int poe_port_id, const char *status)
  */
 void poe_led_shutdown(void)
 {
+	if (led_port_offset < 0)
+		return;
+
 	/* Disable global software control — hardware takes over */
 	led_write_reg(LED_SW_CTRL, 0x00000000);
 	/* Clear per-port enable mask */
