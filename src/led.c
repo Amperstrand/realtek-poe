@@ -152,6 +152,16 @@ static int poe_status_to_led_pattern(const char *status)
 	if (!strcmp(status, "Searching"))
 		return LED_PATTERN_FAST_BLINK;
 
+	/*
+	 * "Requesting power" is the transient BCM state between detection/
+	 * classification and FET power-on. On a healthy port it's sub-second
+	 * and invisible. On unhealthy ports (see RTL8238B Issue #50) it can
+	 * stick — same fast-blink as Searching gives operators a visible
+	 * "trying to bring port up" signal instead of LED-off ambiguity.
+	 */
+	if (!strcmp(status, "Requesting power"))
+		return LED_PATTERN_FAST_BLINK;
+
 	if (!strcmp(status, "Fault") || !strcmp(status, "Other fault"))
 		return LED_PATTERN_SLOW_BLINK;
 
