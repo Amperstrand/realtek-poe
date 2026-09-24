@@ -24,7 +24,9 @@ typedef int (*poe_reply_handler)(struct mcu_state *mcu, uint8_t *reply);
 
 /* Careful with this; Only works for set_detection/disconnect_type commands. */
 #define PORT_ID_ALL	0x7f
-#define MAX_RETRIES	5
+/* Match stock firmware: 16 retries, 50ms delay (reverse-engineered from
+ * ZyXEL V2.90 board_poe.ko: sltiu s4,0x10 + osal_time_usleep(0xc350) */
+#define MAX_RETRIES	16
 
 #define CMD_SIZE	12
 #define OFFSET_CHECKSUM	(CMD_SIZE - 1)
@@ -1062,9 +1064,9 @@ static void handle_f0_reply(struct mcu *mcu, struct cmd *cmd, uint8_t *reply)
 			return;
 		}
 
-		/* Wait for the MCU to recover */
+		/* 50ms matches stock V2.90 (osal_time_usleep(0xc350)) */
 		mcu->error_timeout.cb = mcu_clear_timeout;
-		uloop_timeout_set(&mcu->error_timeout, 100);
+		uloop_timeout_set(&mcu->error_timeout, 50);
 	}
 
 	list_add(&cmd->list, &mcu->pending_cmds);
