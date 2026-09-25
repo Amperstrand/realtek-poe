@@ -898,10 +898,23 @@ static int poe_cmd_port_led_map(struct mcu *mcu, uint8_t first_port)
 	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
 }
 
-static int poe_reply_port_led_map(struct mcu_state *state, uint8_t *reply)
+static int poe_reply_port_led_map(struct mcu_state *state, uint8_t reply[12])
 {
-	struct port_led_map *map = &state->led_maps[reply[2] / 8];
+	size_t idx = reply[2] / 8;
+	struct port_led_map *map;
 
+	/* BCM59111 v17.1 does not implement LED commands and returns 0xFF
+	 * data bytes. reply[2]=0xff gave index 31 into a 6-entry array —
+	 * a 9-byte 0xff OOB write on every boot (landed in struct padding
+	 * until the 2026-09-25 struct-mcu extension moved it onto
+	 * config.ports[].name). Validate the port base before indexing. */
+	if (reply[2] == 0xff || idx >= ARRAY_SIZE(state->led_maps)) {
+		ULOG_WARN("LED map reply with invalid port base %d — ignored\n",
+			  reply[2]);
+		return -1;
+	}
+
+	map = &state->led_maps[idx];
 	map->offset = reply[2];
 	map->ports[0] = reply[3];
 	map->ports[1] = reply[4];
