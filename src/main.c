@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <time.h>
 
 #include <libubox/ustream.h>
 #include <libubox/uloop.h>
@@ -31,6 +32,13 @@ typedef int (*poe_reply_handler)(struct mcu_state *mcu, uint8_t *reply);
 #define CMD_SIZE	12
 #define OFFSET_CHECKSUM	(CMD_SIZE - 1)
 
+/* UART framing resync: poe_stream_msg_cb slices the stream into fixed
+ * CMD_SIZE windows; a stray/partial byte from an MCU crash permanently
+ * misaligns every later window. After this many consecutive undecodable
+ * frames, flush the stream (see mcu_stream_resync). */
+#define BAD_FRAME_RESYNC_THRESHOLD	3
+#define RESYNC_RATELIMIT_MS		1000
+
 struct mcu {
 	struct poe_dialect dialect;
 	struct uloop_timeout response_timeout;
@@ -39,6 +47,17 @@ struct mcu {
 	struct ustream_fd stream;
 	struct mcu_state state;
 	uint8_t cmd_seq;
+
+	/* Link-health state and counters, surfaced via poe info (mcu_comm).
+	 * Rationale: the 2026-09-25 daemon<->MCU wedge served a frozen
+	 * snapshot silently; these make link health observable. */
+	uint64_t last_ok_reply_ms;
+	uint32_t bad_frame_streak;
+	uint32_t last_resync_ms;
+	uint32_t replies_ok, replies_bad, replies_stale;
+	uint32_t rejects_incomplete, rejects_bad_checksum, rejects_not_ready;
+	uint32_t rejects_unknown;
+	uint32_t no_response_events, resyncs;
 };
 
 struct cmd {
@@ -260,6 +279,16 @@ static void config_load(struct config *cfg, int init)
 	uci_free_context(uci);
 }
 
+static uint64_t now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+static void mcu_stream_resync(struct mcu *mcu, const char *why);
+
 static void mcu_no_response(struct uloop_timeout *t)
 {
 	struct mcu *mcu = container_of(t, struct mcu, response_timeout);
@@ -268,9 +297,17 @@ static void mcu_no_response(struct uloop_timeout *t)
 	while (!list_empty(&mcu->pending_cmds)) {
 		cmd = list_first_entry(&mcu->pending_cmds, struct cmd, list);
 		list_del(&cmd->list);
+		free(cmd);
 	}
 
+	mcu->no_response_events++;
 	ULOG_ERR("No response from PoE controller. Trying a reset\n");
+
+	/* A silent MCU may have died mid-reply, leaving partial bytes in the
+	 * stream. If they linger, the MCU's first valid reply after recovery
+	 * lands misaligned and every frame fails checksum (2026-09-25 wedge
+	 * class). Flush now so recovery starts on a clean line. */
+	mcu_stream_resync(mcu, "no-response");
 
 	if (mcu->dialect.desc->ops->reset)
 		mcu->dialect.desc->ops->reset(mcu);
@@ -282,6 +319,32 @@ static void log_packet(int log_level, const char *prefix, const uint8_t d[12])
 	     "%s %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
 	     prefix, d[0], d[1], d[2], d[3], d[4], d[5],
 		     d[6], d[7], d[8], d[9], d[10], d[11]);
+}
+
+/* Discard everything buffered (ustream) and kernel-side (tcflush) so frame
+ * windowing restarts on a byte-aligned boundary. Without this, fixed
+ * CMD_SIZE windowing never re-aligns after stray bytes — the daemon-side
+ * half of the 2026-09-25 wedge (restart was the only resync path). */
+static void mcu_stream_resync(struct mcu *mcu, const char *why)
+{
+	struct ustream *s = &mcu->stream.stream;
+	uint8_t *buf;
+	int len = 0;
+
+	buf = (uint8_t *)ustream_get_read_buf(s, &len);
+	if (len > 0) {
+		ULOG_NOTE("MCU stream resync (%s): discarding %d buffered bytes\n",
+			  why, len);
+		log_packet(LOG_NOTICE, "\tdrop:  ", buf);
+		ustream_consume(s, len);
+	} else {
+		ULOG_NOTE("MCU stream resync (%s)\n", why);
+	}
+	tcflush(mcu->stream.fd.fd, TCIFLUSH);
+
+	mcu->bad_frame_streak = 0;
+	mcu->resyncs++;
+	mcu->last_resync_ms = now_ms();
 }
 
 static int mcu_cmd_send(struct mcu *mcu, struct cmd *cmd)
@@ -1062,6 +1125,20 @@ static void handle_f0_reply(struct mcu *mcu, struct cmd *cmd, uint8_t *reply)
 	reason = GET_STR((uint8_t)(reply[0] - 0xf0), reasons);
 	reason = reason ? reason : "unknown";
 
+	/* The MCU firmware only ever emits 0xfd/0xfe/0xff rejection codes;
+	 * any other 0xf0-family byte on a checksum-valid frame is a
+	 * straddle window that lucked into the checksum — desync evidence
+	 * (zero false positives on an aligned stream). */
+	switch (reply[0]) {
+	case 0xfd: mcu->rejects_incomplete++; break;
+	case 0xfe: mcu->rejects_bad_checksum++; break;
+	case 0xff: mcu->rejects_not_ready++; break;
+	default:
+		mcu->rejects_unknown++;
+		mcu->bad_frame_streak++;
+		break;
+	}
+
 	/* Log the first reply, then only log complete failures. */
 	if (cmd->num_retries == 0) {
 		ULOG_NOTE("MCU rejected command: %s\n", reason);
@@ -1074,6 +1151,10 @@ static void handle_f0_reply(struct mcu *mcu, struct cmd *cmd, uint8_t *reply)
 			ULOG_ERR("Aborting request (%02x) after %d attempts\n",
 				 cmd->cmd[0], cmd->num_retries);
 			free(cmd);
+			/* Re-drive the queue: remaining commands must not
+			 * strand behind an aborted head. */
+			mcu->error_timeout.cb = mcu_clear_timeout;
+			uloop_timeout_set(&mcu->error_timeout, 50);
 			return;
 		}
 
@@ -1085,6 +1166,10 @@ static void handle_f0_reply(struct mcu *mcu, struct cmd *cmd, uint8_t *reply)
 	list_add(&cmd->list, &mcu->pending_cmds);
 }
 
+/* Return convention: 0 = reply handled, advance queue; 1 = head command
+ * requeued/aborted, caller may resend/advance; -1 = frame dropped, head
+ * command still pending (its response timeout is re-armed), do NOT
+ * advance. */
 static int mcu_handle_reply(struct mcu *mcu, uint8_t *reply)
 {
 	const struct dialect_ops *ops = mcu->dialect.desc->ops;
@@ -1096,6 +1181,7 @@ static int mcu_handle_reply(struct mcu *mcu, uint8_t *reply)
 	log_packet(LOG_DEBUG, "RX <-", reply);
 
 	if (list_empty(&mcu->pending_cmds)) {
+		mcu->replies_stale++;
 		ULOG_ERR("received unsolicited reply\n");
 		return -1;
 	}
@@ -1109,28 +1195,61 @@ static int mcu_handle_reply(struct mcu *mcu, uint8_t *reply)
 		sum += reply[i];
 
 	if (reply[OFFSET_CHECKSUM] != sum) {
-		ULOG_DBG("received reply with bad checksum\n");
-		free(cmd);
-		return -1;
+		/* Undecodable frame: line garbage or misaligned windowing.
+		 * Log the streak start at NOTICE (wedge forensics — this
+		 * used to be DBG-only, hiding the 2026-09-25 wedge onset).
+		 * Requeue the head command (bounded) instead of freeing it:
+		 * commands used to vanish silently (rc=0, no port effect)
+		 * during garbage streaks. */
+		mcu->replies_bad++;
+		if (!mcu->bad_frame_streak) {
+			ULOG_NOTE("MCU reply failed checksum validation "
+				  "(bad-frame streak starts)\n");
+			log_packet(LOG_NOTICE, "\tframe: ", reply);
+		}
+		mcu->bad_frame_streak++;
+
+		if (++cmd->num_retries > MAX_RETRIES) {
+			ULOG_ERR("Aborting request (%02x) after %d attempts "
+				 "(undecodable replies)\n",
+				 cmd->cmd[0], cmd->num_retries);
+			free(cmd);
+		} else {
+			list_add(&cmd->list, &mcu->pending_cmds);
+		}
+		return 1;
 	}
 
 	if ((reply[0] & 0xf0) == 0xf0) {
 		handle_f0_reply(mcu, cmd, reply);
-		return -1;
+		return -1;	/* retry paced by error_timeout */
 	}
-
-	free(cmd);
 
 	command = dialect_rev_lookup(&mcu->dialect, reply[0]);
 	if ((reply[0] != cmd_id) || (command < 0)) {
+		/* Valid frame, but not the reply to the pending command: a
+		 * stale reply to a command dropped earlier. Discard the
+		 * FRAME; keep the command pending — the old code freed it,
+		 * burning live commands on stale traffic. */
+		mcu->replies_stale++;
 		ULOG_DBG("received reply with bad command id\n");
+		list_add(&cmd->list, &mcu->pending_cmds);
+		uloop_timeout_set(&mcu->response_timeout, 2000);
 		return -1;
 	}
 
 	if (reply[1] != cmd_seq) {
+		mcu->replies_stale++;
 		ULOG_DBG("received reply with bad sequence number\n");
+		list_add(&cmd->list, &mcu->pending_cmds);
+		uloop_timeout_set(&mcu->response_timeout, 2000);
 		return -1;
 	}
+
+	free(cmd);
+	mcu->replies_ok++;
+	mcu->bad_frame_streak = 0;
+	mcu->last_ok_reply_ms = now_ms();
 
 	if (reply_handler[command]) {
 		return reply_handler[command](&mcu->state, reply);
@@ -1145,14 +1264,23 @@ static void poe_stream_msg_cb(struct ustream *s, int bytes)
 {
 	struct ustream_fd *ufd = container_of(s, struct ustream_fd, stream);
 	struct mcu *mcu = container_of(ufd, struct mcu, stream);
-	int len;
+	int len, ret;
 	uint8_t *reply = (uint8_t *)ustream_get_read_buf(s, &len);
 
-	if (len < 12)
+	if (len < CMD_SIZE)
 		return;
-	mcu_handle_reply(mcu, reply);
-	ustream_consume(s, 12);
-	mcu_cmd_next(mcu);
+	ret = mcu_handle_reply(mcu, reply);	ustream_consume(s, CMD_SIZE);
+
+	/* Framing resync: a streak of undecodable frames means the byte
+	 * stream itself is misaligned (stray/partial bytes from an MCU
+	 * crash). Fixed CMD_SIZE windowing never re-aligns on its own;
+	 * flush and let the pending head retransmit onto a clean line. */
+	if (mcu->bad_frame_streak >= BAD_FRAME_RESYNC_THRESHOLD &&
+	    now_ms() - mcu->last_resync_ms >= RESYNC_RATELIMIT_MS)
+		mcu_stream_resync(mcu, "frame-desync");
+
+	if (ret >= 0)
+		mcu_cmd_next(mcu);
 }
 
 static void poe_stream_notify_cb(struct ustream *s)
@@ -1542,6 +1670,7 @@ static int ubus_poe_info_cb(struct ubus_context *ctx, struct ubus_object *obj,
 	struct poe_ctx *poe = ubus_to_poe_ctx(ctx);
 	const struct mcu_state *state = &poe->mcu.state;
 	const struct config *cfg = &poe->config;
+	struct mcu *mcu = &poe->mcu;
 	struct blob_buf *b = &poe->blob_buf;
 	char tmp[16];
 	size_t i;
@@ -1565,6 +1694,39 @@ static int ubus_poe_info_cb(struct ubus_context *ctx, struct ubus_object *obj,
 	blobmsg_add_double(b, "budget", cfg->budget);
 	blobmsg_add_double(b, "consumption", state->power_consumption);
 	blobmsg_add_double(b, "allocated", state->allocated_power);
+
+	/* Link-health table: never serve a frozen snapshot silently. A
+	 * wedged/stale MCU link shows up as stale=true with rising age_s
+	 * (2026-09-25 wedge class). */
+	{
+		uint64_t age_ms = 0;
+		uint32_t stale_after_ms;
+		int stale = 0;
+
+		if (mcu->last_ok_reply_ms)
+			age_ms = now_ms() - mcu->last_ok_reply_ms;
+		stale_after_ms = MAX(cfg->poll_interval_ms * 3, 10000);
+		if (mcu->last_ok_reply_ms && age_ms > stale_after_ms)
+			stale = 1;
+
+		c = blobmsg_open_table(b, "mcu_comm");
+		blobmsg_add_u64(b, "age_s", age_ms / 1000);
+		blobmsg_add_u8(b, "stale", stale);
+		blobmsg_add_u32(b, "replies_ok", mcu->replies_ok);
+		blobmsg_add_u32(b, "replies_bad", mcu->replies_bad);
+		blobmsg_add_u32(b, "replies_stale", mcu->replies_stale);
+		blobmsg_add_u32(b, "rejects",
+				mcu->rejects_incomplete +
+				mcu->rejects_bad_checksum +
+				mcu->rejects_not_ready +
+				mcu->rejects_unknown);
+		blobmsg_add_u32(b, "rejects_not_ready", mcu->rejects_not_ready);
+		blobmsg_add_u32(b, "rejects_bad_checksum",
+				mcu->rejects_bad_checksum);
+		blobmsg_add_u32(b, "no_response", mcu->no_response_events);
+		blobmsg_add_u32(b, "resyncs", mcu->resyncs);
+		blobmsg_close_table(b, c);
+	}
 
 	c = blobmsg_open_table(b, "ports");
 	for (i = 0; i < cfg->port_count; i++) {
