@@ -56,8 +56,7 @@ fixing in fakemcu if the harness is reused.
 ## Deploy + verification (2026-09-25)
 
 - Package `realtek-poe-5.apk` built in `openwrt/sdk:realtek-rtl838x-25.12.1`,
-  sha256 c2288f69… wait — that was r3; r5 deployed from
-  bin/packages/mips_24kc/base/realtek-poe-5.apk (deployed 14:22Z).
+  sha256 4e677901306b3703555931fe91b85e52e63d793d6a8fa25b89c29ffc5b6f674d, deployed 14:22Z from bin/packages/mips_24kc/base/.
 - `apk add --allow-untrusted --force-non-repository` under the bench
   flock + ONE daemon restart (no switch reboot; healthy PDs unaffected —
   consistent with all prior restarts).
